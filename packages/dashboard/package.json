@@ -1,0 +1,29 @@
+{
+  "name": "@algora/dashboard",
+  "version": "0.0.1",
+  "type": "module",
+  "scripts": {
+    "dev": "next dev --port 3456",
+    "build": "next build",
+    "start": "next start --port 3456"
+  },
+  "dependencies": {
+    "@algora/core": "*",
+    "@tanstack/react-query": "^5.68.0",
+    "@trpc/client": "^11.0.0",
+    "@trpc/next": "^11.0.0",
+    "@trpc/react-query": "^11.0.0",
+    "@trpc/server": "^11.0.0",
+    "next": "^15.2.3",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "superjson": "^2.2.2"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.12",
+    "@types/react-dom": "^19.0.4",
+    "tailwindcss": "^4.0.14",
+    "@tailwindcss/postcss": "^4.0.14",
+    "typescript": "^5.8.2"
+  }
+}

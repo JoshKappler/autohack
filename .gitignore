@@ -1,0 +1,14 @@
+node_modules/
+dist/
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+data/logs/
+data/solver-status.json
+data/memory.json
+.workspaces/
+.env
+.env.local
+*.tsbuildinfo
+.next/

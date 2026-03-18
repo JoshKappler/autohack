@@ -1,0 +1,9 @@
+{
+  "name": "@algora/monitor",
+  "version": "0.0.1",
+  "type": "module",
+  "main": "src/index.ts",
+  "dependencies": {
+    "@algora/core": "*"
+  }
+}
