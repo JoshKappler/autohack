@@ -1,0 +1,1 @@
+ALTER TABLE `bounties` DROP COLUMN `estimated_hours`;

@@ -363,9 +363,6 @@ export default function Home() {
               <span className="text-xs font-medium" style={{ color: "var(--text-dim)" }}>
                 Live Output
               </span>
-              <span className="text-[10px]" style={{ color: "var(--text-dim)" }}>
-                auto-scrolling
-              </span>
             </div>
             <LogViewer bountyId={solverStatus.bountyId!} />
           </div>
@@ -505,7 +502,7 @@ export default function Home() {
                 </span>
                 <span>
                   {(selectedBounties[0] as any).priorityScore != null
-                    ? `${((selectedBounties[0] as any).priorityScore / 100).toFixed(0)} pts`
+                    ? `${((selectedBounties[0] as any).priorityScore).toFixed(1)} pts`
                     : ""}
                 </span>
               </div>
@@ -522,7 +519,9 @@ export default function Home() {
               className="w-full rounded-lg py-2.5 text-sm font-semibold transition-colors disabled:opacity-40"
               style={{ background: "var(--green)", color: "#000" }}
             >
-              {isAgentActive ? "Solving..." : "Start Auto Solve"}
+              {isAgentActive
+                ? (solverStatus?.trigger === "manual" ? "Solver Busy" : "Solving...")
+                : "Start Auto Solve"}
             </button>
             {autoSolveError && (
               <p className="mt-2 text-center text-xs" style={{ color: "var(--red)" }}>

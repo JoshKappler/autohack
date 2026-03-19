@@ -266,8 +266,9 @@ ${previousOutput.slice(-1500)}
 }
 
 /**
- * Spawn Claude CLI with streaming output to a log file.
- * Returns the captured stdout when the process exits successfully.
+ * Spawn Claude CLI with stream-json output for rich terminal display.
+ * Saves raw JSON events to {logFile}.jsonl for the dashboard viewer.
+ * Returns the accumulated text output when the process exits.
  */
 async function spawnClaude(
   prompt: string,
@@ -277,6 +278,7 @@ async function spawnClaude(
   onMetrics?: (metrics: { linesOutput: number; lastActivity: string }) => void,
 ): Promise<string> {
   const config = getConfig();
+  const eventsFile = logFile.replace(/\.log$/, ".jsonl");
 
   return new Promise<string>((resolvePromise, reject) => {
     const claudePath = process.env.CLAUDE_PATH || "claude";
@@ -284,6 +286,8 @@ async function spawnClaude(
       claudePath,
       [
         "--print",
+        "--verbose",
+        "--output-format", "stream-json",
         "--dangerously-skip-permissions",
         "--model",
         config.CLAUDE_MODEL,
@@ -305,26 +309,60 @@ async function spawnClaude(
     child.stdin.write(prompt);
     child.stdin.end();
 
-    let output = "";
+    let textOutput = "";
+    let resultText = ""; // Text from the final result event (preferred)
     let linesOutput = 0;
     let chunksSinceMetrics = 0;
+    let lineBuf = "";
 
-    const onData = async (chunk: Buffer) => {
-      const text = chunk.toString();
-      output += text;
-      linesOutput += (text.match(/\n/g) || []).length;
-      chunksSinceMetrics++;
-      try {
-        await appendFile(logFile, text);
-      } catch {}
-      if (onMetrics && chunksSinceMetrics >= 10) {
+    const onStdout = async (chunk: Buffer) => {
+      const raw = chunk.toString();
+      lineBuf += raw;
+
+      // stream-json emits one JSON object per line
+      const lines = lineBuf.split("\n");
+      lineBuf = lines.pop() ?? "";
+
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        linesOutput++;
+        chunksSinceMetrics++;
+
+        // Write raw JSON event to .jsonl for the rich dashboard viewer
+        try {
+          await appendFile(eventsFile, line + "\n");
+        } catch {}
+
+        // Extract text content for the return value
+        try {
+          const event = JSON.parse(line);
+          if (event.type === "assistant" && event.message?.content) {
+            const texts = event.message.content
+              .filter((c: any) => c.type === "text")
+              .map((c: any) => c.text);
+            textOutput += texts.join("");
+          }
+          if (event.type === "result" && typeof event.result === "string") {
+            resultText = event.result;
+          }
+        } catch {}
+      }
+
+      if (onMetrics && chunksSinceMetrics >= 5) {
         chunksSinceMetrics = 0;
         onMetrics({ linesOutput, lastActivity: new Date().toISOString() });
       }
     };
 
-    child.stdout.on("data", onData);
-    child.stderr.on("data", onData);
+    const onStderr = async (chunk: Buffer) => {
+      const text = chunk.toString();
+      try {
+        await appendFile(logFile, text);
+      } catch {}
+    };
+
+    child.stdout.on("data", onStdout);
+    child.stderr.on("data", onStderr);
 
     const timer = setTimeout(() => {
       child.kill("SIGTERM");
@@ -340,9 +378,22 @@ async function spawnClaude(
     child.on("close", async (code) => {
       clearTimeout(timer);
       activeChild = null;
+
+      // Process any remaining buffered data
+      if (lineBuf.trim()) {
+        try { await appendFile(eventsFile, lineBuf + "\n"); } catch {}
+        try {
+          const event = JSON.parse(lineBuf);
+          if (event.type === "result" && typeof event.result === "string") {
+            resultText = event.result;
+          }
+        } catch {}
+      }
+
       await appendFile(logFile, `\n[${new Date().toISOString()}] Process exited with code ${code}\n`).catch(() => {});
       if (code === 0) {
-        resolvePromise(output);
+        // Prefer the result event's text (complete final output) over accumulated text
+        resolvePromise(resultText || textOutput);
       } else {
         reject(new Error(`Claude CLI exited with code ${code}`));
       }
@@ -359,6 +410,7 @@ const MAX_NO_CHANGES_RETRIES = 2;
 export async function runClaudeSolver(
   bounty: Bounty,
   repoPath: string,
+  trigger?: "auto" | "manual",
 ): Promise<SolveResult> {
   const config = getConfig();
   const [issueBody, issueComments] = await Promise.all([
@@ -378,10 +430,13 @@ export async function runClaudeSolver(
   const logDir = getLogDir();
   await mkdir(logDir, { recursive: true });
   const logFile = join(logDir, `${bounty.id}.log`);
+  const eventsFile = join(logDir, `${bounty.id}.jsonl`);
   await writeFile(logFile, `[${new Date().toISOString()}] Solver started for ${bounty.repoOwner}/${bounty.repoName}#${bounty.issueNumber}\n`, "utf-8");
+  await writeFile(eventsFile, "", "utf-8"); // Clear previous events
 
   await writeSolverStatus({
     active: true,
+    trigger,
     bountyId: bounty.id,
     repo: `${bounty.repoOwner}/${bounty.repoName}`,
     issueNumber: bounty.issueNumber,
@@ -399,6 +454,7 @@ export async function runClaudeSolver(
       if (pid) {
         await writeSolverStatus({
           active: true,
+          trigger,
           bountyId: bounty.id,
           repo: `${bounty.repoOwner}/${bounty.repoName}`,
           issueNumber: bounty.issueNumber,
@@ -416,6 +472,7 @@ export async function runClaudeSolver(
 
     const statusBase = {
       active: true as const,
+      trigger,
       bountyId: bounty.id,
       repo: `${bounty.repoOwner}/${bounty.repoName}`,
       issueNumber: bounty.issueNumber,

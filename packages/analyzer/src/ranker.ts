@@ -1,4 +1,4 @@
-import { eq, sql } from "drizzle-orm";
+import { desc, eq, sql } from "drizzle-orm";
 import {
   getDb,
   schema,
@@ -8,7 +8,7 @@ import {
   classifyError,
   type Bounty,
 } from "@algora/core";
-import { scoutRepo, countCompetition } from "./codebase-scout";
+import { scoutRepo, fetchIssueComments, countCompetition } from "./codebase-scout";
 import { assessFeasibility } from "./feasibility";
 
 const log = createLogger("ranker");
@@ -52,36 +52,47 @@ export async function analyzeAndRank(bounty: Bounty): Promise<void> {
         stars: 0,
         hasCI: false,
         openIssues: 0,
+        testFramework: null,
       };
     }
+
+    // Fetch issue comments — used for both competition counting and feasibility context
+    const { commentText, comments } = await fetchIssueComments(
+      bounty.repoOwner,
+      bounty.repoName,
+      bounty.issueNumber,
+    );
 
     const { attempts, existingPRs } = await countCompetition(
       bounty.repoOwner,
       bounty.repoName,
       bounty.issueNumber,
+      comments,
     );
 
     const labels: string[] = bounty.labels
       ? JSON.parse(bounty.labels)
       : [];
 
-    // assessFeasibility never throws — always returns a result
+    // assessFeasibility throws on failure — bounty resets to "discovered" for retry
     const result = await assessFeasibility(
       bounty.title,
       bounty.body,
       labels,
       repoInfo,
       attempts + existingPRs,
+      bounty.rewardCents,
+      commentText,
     );
 
-    // Priority score: expected value in dollars (reward × feasibility)
-    const priorityScore = (bounty.rewardCents / 100) * result.feasibility;
+    // Priority score: competition-adjusted expected reward
+    const competitors = attempts + existingPRs;
+    const priorityScore = ((bounty.rewardCents / 100) * result.feasibility) / (1 + competitors);
 
     db.update(schema.bounties)
       .set({
         status: "selected",
         feasibilityScore: result.feasibility,
-        estimatedHours: result.estimatedHours,
         analysisNotes: JSON.stringify({
           approach: result.approach,
           riskFactors: result.riskFactors,
@@ -104,7 +115,7 @@ export async function analyzeAndRank(bounty: Bounty): Promise<void> {
         status: "success",
         completedAt: new Date(),
         durationMs: Date.now() - startTime,
-        logs: `feasibility=${result.feasibility.toFixed(2)}, score=${priorityScore.toFixed(2)}, hours=${result.estimatedHours}`,
+        logs: `feasibility=${result.feasibility.toFixed(2)}, score=${priorityScore.toFixed(2)}`,
       })
       .where(eq(schema.pipelineRuns.id, run.id))
       .run();
@@ -132,7 +143,17 @@ export async function analyzeAndRank(bounty: Bounty): Promise<void> {
       .where(eq(schema.pipelineRuns.id, run.id))
       .run();
 
-    log.error({ traceId, err, bountyId: bounty.id }, "Analysis failed");
+    // Reset bounty back to "discovered" so the queue retries on the next cron cycle
+    db.update(schema.bounties)
+      .set({
+        status: "discovered",
+        retryCount: sql`${schema.bounties.retryCount} + 1`,
+        updatedAt: new Date(),
+      })
+      .where(eq(schema.bounties.id, bounty.id))
+      .run();
+
+    log.error({ traceId, err, bountyId: bounty.id }, "Analysis failed — reset to discovered for retry");
     throw err;
   }
 }
@@ -140,7 +161,7 @@ export async function analyzeAndRank(bounty: Bounty): Promise<void> {
 export async function processAnalysisQueue(): Promise<void> {
   const db = getDb();
 
-  // Continuously process all discovered bounties, lowest reward first
+  // Continuously process all discovered bounties, highest reward first
   while (true) {
     // Global mutex: don't analyze while solver is active
     const activeSolve = db
@@ -160,8 +181,8 @@ export async function processAnalysisQueue(): Promise<void> {
     const pending = db
       .select()
       .from(schema.bounties)
-      .where(sql`${schema.bounties.status} = 'discovered' AND ${schema.bounties.rewardCents} >= ${config.MIN_BOUNTY_CENTS}`)
-      .orderBy(schema.bounties.rewardCents)
+      .where(sql`${schema.bounties.status} = 'discovered' AND ${schema.bounties.rewardCents} >= ${config.MIN_BOUNTY_CENTS} AND ${schema.bounties.retryCount} < ${config.MAX_ANALYSIS_RETRIES}`)
+      .orderBy(desc(schema.bounties.rewardCents))
       .limit(1)
       .get();
 
@@ -171,6 +192,12 @@ export async function processAnalysisQueue(): Promise<void> {
     }
 
     log.info({ title: pending.title, reward: `$${(pending.rewardCents / 100).toFixed(2)}` }, "Analyzing bounty");
-    await analyzeAndRank(pending);
+    try {
+      await analyzeAndRank(pending);
+    } catch (err) {
+      // Log and continue — don't let one failing bounty block the rest of the queue.
+      // Analysis failed, bounty was reset to "discovered" so the queue moves to the next one.
+      log.error({ err, bountyId: pending.id }, "Analysis failed for bounty, continuing queue");
+    }
   }
 }

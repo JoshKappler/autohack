@@ -4,9 +4,7 @@ dist/
 *.db-journal
 *.db-shm
 *.db-wal
-data/logs/
-data/solver-status.json
-data/memory.json
+data/
 .workspaces/
 .env
 .env.local

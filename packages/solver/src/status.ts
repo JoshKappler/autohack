@@ -7,6 +7,7 @@ const log = createLogger("solver-status");
 
 export interface SolverStatus {
   active: boolean;
+  trigger?: "auto" | "manual";
   bountyId?: string;
   repo?: string;
   issueNumber?: number;

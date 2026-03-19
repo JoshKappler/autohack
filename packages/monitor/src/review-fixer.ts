@@ -4,7 +4,7 @@ import { existsSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { rm, mkdir, writeFile, appendFile } from "node:fs/promises";
 import { eq } from "drizzle-orm";
-import { getConfig, getDb, schema, createLogger, recordReviewFix } from "@algora/core";
+import { getConfig, getDb, schema, createLogger, recordReviewFix, stageFilteredChanges } from "@algora/core";
 import type { PendingReview } from "./review-watcher";
 import { getPrDiff } from "./responder";
 
@@ -172,7 +172,7 @@ ${reviewContext}
           "--print",
           "--dangerously-skip-permissions",
           "--model", config.CLAUDE_MODEL,
-          "--max-turns", "30",
+          "--max-turns", String(Math.min(config.MAX_TURNS, 30)),
           "-", // read prompt from stdin
         ],
         {
@@ -224,12 +224,8 @@ ${reviewContext}
       return false;
     }
 
-    // Stage and commit the fix
-    await execFileAsync("git", ["add", "-A"], { cwd: repoPath });
-    // Unstage files that shouldn't be committed
-    for (const pattern of ["package-lock.json", "yarn.lock", "pnpm-lock.yaml", "Cargo.lock", "go.sum", ".env", "CLAUDE.md"]) {
-      await execFileAsync("git", ["reset", "HEAD", pattern], { cwd: repoPath }).catch(() => {});
-    }
+    // Stage only intentional changes (no lock files, artifacts, etc.)
+    await stageFilteredChanges(repoPath);
 
     const commitMsg = `fix: address review feedback on #${bounty.issueNumber}`;
     await execFileAsync("git", ["commit", "-m", commitMsg], { cwd: repoPath });

@@ -1,5 +1,7 @@
 import { eq, sql, desc } from "drizzle-orm";
 import { writeFile, appendFile, mkdir } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { join } from "node:path";
 import { getDb, schema, getConfig, createLogger, isTransientError, generateTraceId, classifyError, recordSolveOutcome, type Bounty } from "@algora/core";
 import { cloneRepo, createBranch, cleanupWorkspace } from "./repo-manager";
@@ -36,7 +38,7 @@ export async function processNextBounty(): Promise<void> {
   }
 
   // Find the next selected bounty (or approved bounty if approval required)
-  // Prioritize by priority score (reward × feasibility / difficulty)
+  // Prioritize by priority score (reward × feasibility / competition)
   const next = db
     .select()
     .from(schema.bounties)
@@ -53,7 +55,7 @@ export async function processNextBounty(): Promise<void> {
   solving = true;
 
   try {
-    await solveBounty(next);
+    await solveBounty(next, "auto");
   } finally {
     solving = false;
   }
@@ -71,7 +73,7 @@ async function appendLog(bountyId: string, message: string): Promise<void> {
   } catch {}
 }
 
-export async function solveBounty(bounty: Bounty): Promise<void> {
+export async function solveBounty(bounty: Bounty, trigger?: "auto" | "manual"): Promise<void> {
   const db = getDb();
   const config = getConfig();
   const startTime = Date.now();
@@ -149,13 +151,51 @@ export async function solveBounty(bounty: Bounty): Promise<void> {
       }
     }
 
+    // 2c. Verify the GitHub issue is still open before investing solve time
+    try {
+      const execFileAsync = promisify(execFile);
+      const { stdout } = await execFileAsync("gh", [
+        "issue", "view", String(bounty.issueNumber),
+        "--repo", `${bounty.repoOwner}/${bounty.repoName}`,
+        "--json", "state",
+      ]);
+      const issueState = JSON.parse(stdout).state;
+      if (issueState !== "OPEN") {
+        log.info({ id: bounty.id, state: issueState }, "Issue no longer open — marking as removed");
+        await appendLog(bounty.id, `Issue is ${issueState}, skipping solve`);
+        db.update(schema.bounties)
+          .set({ status: "removed", updatedAt: new Date() })
+          .where(eq(schema.bounties.id, bounty.id))
+          .run();
+        await cleanupWorkspace(bounty.repoOwner, bounty.repoName);
+        db.update(schema.pipelineRuns)
+          .set({ status: "failed", errorCategory: "permanent", errorMessage: "Issue closed", completedAt: new Date(), durationMs: Date.now() - startTime })
+          .where(eq(schema.pipelineRuns.id, run.id))
+          .run();
+        await recordSolveOutcome({
+          bountyId: bounty.id,
+          repo: `${bounty.repoOwner}/${bounty.repoName}`,
+          language: bounty.language,
+          rewardCents: bounty.rewardCents,
+          feasibilityScore: bounty.feasibilityScore,
+          outcome: "failed",
+          errorSummary: "Issue closed before solve started",
+          durationMs: Date.now() - startTime,
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+    } catch (err) {
+      log.warn({ err, id: bounty.id }, "Failed to check issue state — proceeding with solve");
+    }
+
     db.update(schema.bounties)
       .set({ status: "solving", updatedAt: new Date() })
       .where(eq(schema.bounties.id, bounty.id))
       .run();
 
     // 3. Run Claude Code
-    let result = await runClaudeSolver(bounty, repoPath);
+    let result = await runClaudeSolver(bounty, repoPath, trigger);
 
     // 4. Validate (with targeted retry loop)
     if (result.success) {
@@ -187,6 +227,7 @@ ${validation.lintOutput ? `### Lint output (last 2000 chars)\n\`\`\`\n${validati
         result = await runClaudeSolver(
           { ...bounty, body: fixPrompt },
           repoPath,
+          trigger,
         );
 
         if (!result.success) break;

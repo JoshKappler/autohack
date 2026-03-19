@@ -1,3 +1,5 @@
+export type ProviderName = "algora" | "github" | "hackerone";
+
 export interface AlgoraBounty {
   id: string;
   status: string;
@@ -20,7 +22,6 @@ export interface AlgoraBounty {
 
 export interface FeasibilityResult {
   feasibility: number; // 0-1
-  estimatedHours: number;
   riskFactors: string[];
   approach: string;
   requiresPlanComment: boolean;
@@ -42,4 +43,5 @@ export interface RepoInfo {
   stars: number;
   hasCI: boolean;
   openIssues: number;
+  testFramework: string | null;
 }

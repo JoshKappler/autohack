@@ -114,6 +114,7 @@ export default function BountiesPage() {
               <SortHeader label="Reward" field="rewardCents" sortBy={sortBy} sortDir={sortDir} setSortBy={setSortBy} setSortDir={setSortDir} />
               <th className="pb-3 font-medium" style={{ color: "var(--text-dim)" }}>Status</th>
               <SortHeader label="Feasibility" field="feasibilityScore" sortBy={sortBy} sortDir={sortDir} setSortBy={setSortBy} setSortDir={setSortDir} />
+              <th className="pb-3 font-medium" style={{ color: "var(--text-dim)" }}>Comp.</th>
               <SortHeader label="Score" field="priorityScore" sortBy={sortBy} sortDir={sortDir} setSortBy={setSortBy} setSortDir={setSortDir} />
               <SortHeader label="Updated" field="updatedAt" sortBy={sortBy} sortDir={sortDir} setSortBy={setSortBy} setSortDir={setSortDir} />
               <th className="pb-3 font-medium" style={{ color: "var(--text-dim)" }}>Actions</th>
@@ -122,7 +123,7 @@ export default function BountiesPage() {
           <tbody>
             {isLoading && (
               <tr>
-                <td colSpan={7} className="py-8 text-center" style={{ color: "var(--text-dim)" }}>
+                <td colSpan={8} className="py-8 text-center" style={{ color: "var(--text-dim)" }}>
                   Loading...
                 </td>
               </tr>
@@ -166,7 +167,16 @@ export default function BountiesPage() {
                     : "—"}
                 </td>
                 <td className="py-3 pr-4 font-mono text-xs">
-                  {b.priorityScore != null ? `${(b.priorityScore / 100).toFixed(0)} pts` : "—"}
+                  {(() => {
+                    try {
+                      if (!b.analysisNotes) return "—";
+                      const notes = JSON.parse(b.analysisNotes);
+                      return (notes.attempts ?? 0) + (notes.existingPRs ?? 0);
+                    } catch { return "—"; }
+                  })()}
+                </td>
+                <td className="py-3 pr-4 font-mono text-xs">
+                  {b.priorityScore != null ? `${b.priorityScore.toFixed(1)} pts` : "—"}
                 </td>
                 <td className="py-3 pr-4 text-xs" style={{ color: "var(--text-dim)" }}>
                   {timeAgo(b.updatedAt)}
@@ -230,7 +240,7 @@ export default function BountiesPage() {
             ))}
             {bounties?.length === 0 && (
               <tr>
-                <td colSpan={7} className="py-8 text-center" style={{ color: "var(--text-dim)" }}>
+                <td colSpan={8} className="py-8 text-center" style={{ color: "var(--text-dim)" }}>
                   No bounties found
                 </td>
               </tr>

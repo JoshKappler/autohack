@@ -7,3 +7,6 @@ export { runClaude } from "./claude";
 export { isTransientError } from "./errors";
 export { generateTraceId, classifyError } from "./trace";
 export { recordSolveOutcome, recordReviewFix, getRepoFailureCount, getPerformanceSummary, getLearningContext } from "./memory";
+export { recordSecurityHuntOutcome, recordSecurityFindingOutcome, getSecurityLearningContext, getSecurityHuntHistory, recordNearMiss, updateProgramNotes, getSecurityProgramContext } from "./security-memory";
+export { EXCLUDE_PATTERNS, stageFilteredChanges } from "./git-utils";
+export { extractJsonWithKey } from "./json-utils";

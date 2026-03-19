@@ -1,0 +1,55 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1773809352184,
+      "tag": "0000_polite_charles_xavier",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1773810854415,
+      "tag": "0001_sharp_victor_mancha",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1774022400000,
+      "tag": "0002_multi_provider",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1773816535610,
+      "tag": "0003_chilly_queen_noir",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1773817400095,
+      "tag": "0004_loose_aaron_stack",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1773868693572,
+      "tag": "0005_tough_praxagora",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1773902278118,
+      "tag": "0006_workable_nightmare",
+      "breakpoints": true
+    }
+  ]
+}

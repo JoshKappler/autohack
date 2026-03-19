@@ -27,5 +27,6 @@ TypeScript monorepo (pnpm workspaces) that discovers GitHub bounties and solves 
 - Config is loaded from env vars via Zod schema in `packages/core/src/config.ts`. Runtime overrides supported for dashboard control.
 - Database is SQLite via `better-sqlite3` + `drizzle-orm`. Schema in `packages/core/src/db/schema.ts`.
 - Bounty state machine: discovered → analyzing → selected → attempting → solving → pr_created → in_review → merged/rejected/failed.
-- Priority score formula: `reward × feasibility / (estimatedHours × (1 + competitors))`. Higher = solve first.
+- Priority score formula: `reward_dollars × feasibility / (1 + competitors)`. Unit: competition-adjusted expected reward. Higher = solve first.
+- Analysis queue processes highest-reward bounties first. Failed assessments do not enter the queue (bounty stays in "analyzing" for retry).
 - Pipeline tracing: every analysis and solve run gets a `traceId` (e.g., `trc_a1b2c3d4`) stored in `pipelineRuns`. Errors are classified into categories (transient, permanent, validation, timeout, no_changes, git_error) for the Traces dashboard.

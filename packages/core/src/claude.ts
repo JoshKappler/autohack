@@ -8,6 +8,7 @@ interface RunClaudeOpts {
   timeoutMs?: number;
   model?: string;
   maxTokens?: number;
+  temperature?: number;
 }
 
 /** Map short model names to full API model identifiers. */
@@ -47,7 +48,11 @@ function runClaudeCLI(
   const model = opts?.model ?? config.CLAUDE_MODEL;
   const claudePath = process.env.CLAUDE_PATH || "claude";
 
-  log.debug({ model }, "Running Claude via CLI (Max subscription)");
+  if (opts?.temperature != null) {
+    log.debug({ model, temperature: opts.temperature }, "Running Claude via CLI (Max subscription) — note: CLI does not support temperature flag, ignored");
+  } else {
+    log.debug({ model }, "Running Claude via CLI (Max subscription)");
+  }
 
   return new Promise((resolve, reject) => {
     // Strip ANTHROPIC_API_KEY from env so CLI uses Max subscription auth
@@ -133,6 +138,7 @@ async function runClaudeAPI(
   const response = await client.messages.create({
     model,
     max_tokens: opts?.maxTokens ?? 4096,
+    ...(opts?.temperature != null ? { temperature: opts.temperature } : {}),
     messages: [{ role: "user", content: prompt }],
   });
 
