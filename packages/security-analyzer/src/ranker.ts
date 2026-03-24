@@ -7,7 +7,7 @@ import {
   classifyError,
   type SecurityProgram,
   type SecurityFinding,
-} from "@algora/core";
+} from "@bounty/core";
 import { assessProgram, assessFinding } from "./assessor";
 
 const log = createLogger("security-ranker");
@@ -41,6 +41,7 @@ export async function analyzeProgram(program: SecurityProgram): Promise<void> {
       scopes: existing.scopes ?? [],
       assessment: {
         opportunityScore: result.opportunityScore,
+        rubric: result.rubric,
         targetCount: result.targetCount,
         topTargets: result.topTargets,
         techStack: result.techStack,
@@ -160,7 +161,7 @@ export async function analyzeAndRankFinding(finding: SecurityFinding): Promise<v
  * Process the analysis queue for security programs.
  * Analyzes all unassessed active programs.
  */
-export async function processSecurityProgramQueue(): Promise<number> {
+export async function processSecurityProgramQueue(opts?: { skipSignalRequired?: boolean }): Promise<number> {
   const db = getDb();
   let analyzed = 0;
 
@@ -173,6 +174,8 @@ export async function processSecurityProgramQueue(): Promise<number> {
     .all();
 
   const unassessed = programs.filter((program) => {
+    // Skip Signal-required programs if option is set
+    if (opts?.skipSignalRequired && program.requiresSignal) return false;
     try {
       const parsed = JSON.parse(program.scopeSummary || "{}");
       return parsed.assessment?.opportunityScore == null;

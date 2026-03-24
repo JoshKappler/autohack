@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { appendFile } from "node:fs/promises";
-import { getConfig, createLogger } from "@algora/core";
+import { getConfig, createLogger } from "@bounty/core";
 
 const log = createLogger("pty-runner");
 
@@ -32,7 +32,9 @@ export async function spawnClaudeWithPty(
   prompt: string,
   logFile: string,
   timeoutMs: number,
-  onMetrics?: (metrics: { linesOutput: number; lastActivity: string }) => void,
+  onMetrics?: (metrics: { linesOutput: number; lastActivity: string; toolUseCount: number; recentEvents: any[] }) => void,
+  cwd?: string,
+  onChild?: (child: ChildProcess | null) => void,
 ): Promise<string> {
   const config = getConfig();
   const claudePath = process.env.CLAUDE_PATH || "claude";
@@ -50,10 +52,13 @@ export async function spawnClaudeWithPty(
     // `script -q /dev/null` allocates a PTY on macOS without writing a typescript file.
     // Claude CLI sees a TTY on stdout and renders its full rich UI.
     const child: ChildProcess = spawn("script", ["-q", "/dev/null", ...claudeArgs], {
-      cwd: "/tmp/security-audit",
+      cwd: cwd ?? "/tmp/security-audit",
       env: getClaudeEnv(),
       stdio: ["pipe", "pipe", "pipe"],
     });
+
+    // Register with claude-runner so force-stop can find this process
+    onChild?.(child);
 
     // Write prompt to stdin
     child.stdin!.write(prompt);
@@ -83,7 +88,7 @@ export async function spawnClaudeWithPty(
 
       if (onMetrics && chunksSinceMetrics >= 5) {
         chunksSinceMetrics = 0;
-        onMetrics({ linesOutput, lastActivity: new Date().toISOString() });
+        onMetrics({ linesOutput, lastActivity: new Date().toISOString(), toolUseCount: 0, recentEvents: [] });
       }
     });
 
@@ -103,11 +108,13 @@ export async function spawnClaudeWithPty(
 
     child.on("error", (err) => {
       clearTimeout(timer);
+      onChild?.(null);
       reject(err);
     });
 
     child.on("close", (code) => {
       clearTimeout(timer);
+      onChild?.(null);
       if (code !== 0 && code !== null) {
         log.warn({ code }, "Claude CLI exited with non-zero code");
       }

@@ -1,12 +1,55 @@
 import { randomBytes } from "node:crypto";
+import { readFileSync, writeFileSync, unlinkSync } from "node:fs";
+import { rm } from "node:fs/promises";
+import { join } from "node:path";
 import { eq, desc, and, or, isNull, lt } from "drizzle-orm";
-import { getDb, schema, getConfig, createLogger, generateTraceId, classifyError, extractJsonWithKey, recordSecurityHuntOutcome, recordNearMiss, updateProgramNotes, runClaude, type SecurityFinding, type SecurityProgram } from "@algora/core";
-import { runProgramHunt, runFindingSolver, killActiveSecurityProcess, detectHuntStrategy, buildAdversarialReviewPrompt, spawnAdversarialVerification } from "./claude-runner";
+import { getDb, schema, getConfig, createLogger, generateTraceId, classifyError, extractJsonWithKey, recordSecurityHuntOutcome, recordNearMiss, updateProgramNotes, getSecurityLearningContext, getSecurityProgramContext, type SecurityFinding, type SecurityProgram } from "@bounty/core";
+import { fetchProgramPolicy, fetchProgramSignalRequirement, fetchAllDisclosedReports, prepareSubmission, submitReport, fetchProgramScopes } from "@bounty/security-discovery";
+import { runProgramHunt, runFindingSolver, killActiveSecurityProcess, detectHuntStrategy, prepareReviewWorkspace, spawnComprehensiveReview, deverbosifyReport, EXCLUDED_VULN_TYPES, type ReviewContext } from "./claude-runner";
 import { clearSecuritySolverStatus, writeAdversarialReviewStatus, clearAdversarialReviewStatus, readAdversarialReviewStatus, cancelAdversarialReview } from "./status";
 
 const log = createLogger("security-solver");
 
 let solving = false;
+
+// Cross-process lock file to prevent concurrent hunts from orchestrator + dashboard
+const HUNT_LOCK_FILE = join(process.env.PROJECT_ROOT || process.cwd(), "data", "security-hunt.lock");
+
+function acquireHuntLock(): boolean {
+  // Check existing lock
+  try {
+    const raw = readFileSync(HUNT_LOCK_FILE, "utf-8");
+    const lock = JSON.parse(raw);
+
+    // If we (same PID) hold the lock, it's stale from a previous crashed hunt
+    if (lock.pid === process.pid) {
+      log.info("Reclaiming own stale hunt lock from previous run");
+    } else {
+      // Check if the locking process is still alive
+      try {
+        process.kill(lock.pid, 0); // signal 0 = just check existence
+        // Process is alive — lock is held
+        return false;
+      } catch {
+        // Process is dead — stale lock, we can take it
+        log.info({ stalePid: lock.pid }, "Removing stale hunt lock");
+      }
+    }
+  } catch {
+    // No lock file or invalid — safe to acquire
+  }
+
+  try {
+    writeFileSync(HUNT_LOCK_FILE, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function releaseHuntLock(): void {
+  try { unlinkSync(HUNT_LOCK_FILE); } catch {}
+}
 
 export function isSecuritySolving(): boolean { return solving; }
 
@@ -27,6 +70,10 @@ export async function huntProgram(
 
   if (solving) {
     throw new Error("Security solver is already busy");
+  }
+
+  if (!acquireHuntLock()) {
+    throw new Error("Security solver is already busy (another process holds the lock)");
   }
 
   solving = true;
@@ -59,9 +106,7 @@ export async function huntProgram(
     const config = getConfig();
     const minConfidence = config.SECURITY_MIN_CONFIDENCE;
     const ACCEPTED_SEVERITIES = new Set(["critical", "high", "medium"]);
-    const EXCLUDED_TYPES = ["information disclosure", "missing security header", "csp",
-      "technology fingerprinting", "version disclosure", "server header", "protection mechanism failure",
-      "rate limiting", "open redirect", "clickjacking", "cookie"];
+    const EXCLUDED_TYPES = EXCLUDED_VULN_TYPES;
 
     // Create findings from the parsed results, recording near-misses for filtered ones
     const acceptedVulnTypes: string[] = [];
@@ -172,37 +217,42 @@ export async function huntProgram(
     throw err;
   } finally {
     solving = false;
-    // Update hunt tracking: count, miss streak (for exponential backoff), last hunted
-    // Only increment miss streak for hunts that actually completed successfully.
-    // Failed/incomplete hunts still update lastHuntedAt (to respect cooldown) but don't penalize.
-    const currentProgram = db.select().from(schema.securityPrograms)
-      .where(eq(schema.securityPrograms.id, program.id)).get();
-    const prevHuntCount = currentProgram?.huntCount ?? 0;
-    const prevMissStreak = currentProgram?.huntMissStreak ?? 0;
-
-    const newMissStreak = !huntSucceeded
-      ? prevMissStreak  // don't penalize for broken/incomplete hunts
-      : findingsCreated > 0 ? 0 : prevMissStreak + 1;
-
-    db.update(schema.securityPrograms)
-      .set({
-        lastHuntedAt: new Date(),
-        huntCount: huntSucceeded ? prevHuntCount + 1 : prevHuntCount,
-        huntMissStreak: newMissStreak,
-        updatedAt: new Date(),
-      })
-      .where(eq(schema.securityPrograms.id, program.id))
-      .run();
-
-    if (huntSucceeded && newMissStreak > 0) {
-      log.info(
-        { programId: program.id, missStreak: newMissStreak, nextCooldownHours: getConfig().SECURITY_HUNT_COOLDOWN_HOURS * Math.pow(2, Math.min(newMissStreak, 6)) },
-        "Program miss streak updated — next cooldown extended",
-      );
-    } else if (!huntSucceeded) {
-      log.warn({ programId: program.id }, "Hunt did not complete successfully — miss streak unchanged");
-    }
+    releaseHuntLock();
     await clearSecuritySolverStatus().catch(() => {});
+
+    // Update hunt tracking: count, miss streak (for exponential backoff), last hunted.
+    // Wrapped in try/catch so a DB error here can't crash the orchestrator loop.
+    try {
+      const currentProgram = db.select().from(schema.securityPrograms)
+        .where(eq(schema.securityPrograms.id, program.id)).get();
+      const prevHuntCount = currentProgram?.huntCount ?? 0;
+      const prevMissStreak = currentProgram?.huntMissStreak ?? 0;
+
+      const newMissStreak = !huntSucceeded
+        ? prevMissStreak  // don't penalize for broken/incomplete hunts
+        : findingsCreated > 0 ? 0 : prevMissStreak + 1;
+
+      db.update(schema.securityPrograms)
+        .set({
+          lastHuntedAt: new Date(),
+          huntCount: huntSucceeded ? prevHuntCount + 1 : prevHuntCount,
+          huntMissStreak: newMissStreak,
+          updatedAt: new Date(),
+        })
+        .where(eq(schema.securityPrograms.id, program.id))
+        .run();
+
+      if (huntSucceeded && newMissStreak > 0) {
+        log.info(
+          { programId: program.id, missStreak: newMissStreak, nextCooldownHours: getConfig().SECURITY_HUNT_COOLDOWN_HOURS * Math.pow(2, Math.min(newMissStreak, 6)) },
+          "Program miss streak updated — next cooldown extended",
+        );
+      } else if (!huntSucceeded) {
+        log.warn({ programId: program.id }, "Hunt did not complete successfully — miss streak unchanged");
+      }
+    } catch (finallyErr) {
+      log.error({ err: finallyErr, programId: program.id }, "Failed to update hunt tracking in finally block");
+    }
   }
 }
 
@@ -220,11 +270,16 @@ export async function solveSecurityFinding(
     throw new Error("Security solver is already busy");
   }
 
+  if (!acquireHuntLock()) {
+    throw new Error("Security solver is already busy (another process holds the lock)");
+  }
+
   const program = finding.programId
     ? db.select().from(schema.securityPrograms).where(eq(schema.securityPrograms.id, finding.programId)).get()
     : null;
 
   if (!program) {
+    releaseHuntLock();
     throw new Error(`No program found for finding ${finding.id}`);
   }
 
@@ -281,6 +336,7 @@ export async function solveSecurityFinding(
     log.error({ err, findingId: finding.id }, "Finding solve error — reverted to report_ready for user review");
   } finally {
     solving = false;
+    releaseHuntLock();
     await clearSecuritySolverStatus().catch(() => {});
   }
 }
@@ -291,6 +347,7 @@ export async function solveSecurityFinding(
 export async function forceStopSecuritySolver(): Promise<{ killed: boolean; resetFindingId: string | null }> {
   const killed = killActiveSecurityProcess();
   solving = false;
+  releaseHuntLock();
 
   const db = getDb();
   const stuck = db
@@ -354,19 +411,88 @@ export function pickBestFinding(): SecurityFinding | null {
 }
 
 /**
- * Pick the best program for auto-hunt using saturation-aware scoring.
- *
- * The goal: surface programs where we have the highest chance of finding something,
- * not just the ones with the biggest payouts. Programs that are newer and less
- * researched get a significant boost over established, heavily-hunted programs.
+ * Score a single program for hunt priority using saturation-aware scoring.
  *
  * Score = opportunityScore² × log₁₀(reward+1) × responseEfficiency × sourceCodeBoost
  *         × freshnessMult × saturationMult / (1 + missStreak)
  *
- * freshnessMult: Programs < 6 months old get 2x. Decays to 0.5x for programs > 4 years old.
- * saturationMult: Programs with few disclosed reports get a boost. Many disclosures = penalty.
+ * Returns the score, or null if the program can't be scored (no assessment).
  */
-export function pickBestProgram(): SecurityProgram | null {
+export function scoreProgram(p: SecurityProgram): number | null {
+  const now = Date.now();
+  try {
+    const parsed = JSON.parse(p.scopeSummary || "{}");
+    const opportunityScore = parsed.assessment?.opportunityScore ?? 0;
+    if (opportunityScore === 0) return null; // not yet assessed
+
+    const rewardMaxDollars = (p.rewardMaxCents ?? 0) / 100;
+    const efficiency = p.responseEfficiency ?? 0.5;
+    const missStreak = p.huntMissStreak ?? 0;
+
+    // Boost programs with source code in scope
+    const scopes = parsed.scopes ?? [];
+    const hasSourceCode = scopes.some(
+      (s: any) =>
+        s.assetType === "SOURCE_CODE" ||
+        (s.assetIdentifier?.includes("github.com")) ||
+        (s.assetIdentifier?.includes("gitlab.com")),
+    );
+    const sourceCodeBoost = hasSourceCode ? 1.5 : 1.0;
+
+    // Freshness: newer programs = less picked over
+    let freshnessMult = 1.0;
+    if (p.launchedAt) {
+      const ageMonths = (now - p.launchedAt.getTime()) / (30.44 * 24 * 60 * 60 * 1000);
+      if (ageMonths < 6) freshnessMult = 2.0;
+      else if (ageMonths < 12) freshnessMult = 1.5;
+      else if (ageMonths < 24) freshnessMult = 1.0;
+      else if (ageMonths < 48) freshnessMult = 0.7;
+      else freshnessMult = 0.5;
+    }
+
+    // Saturation: fewer disclosed reports = more low-hanging fruit
+    let saturationMult = 1.0;
+    const reportCount = p.disclosedReportCount;
+    if (reportCount != null) {
+      if (reportCount <= 5) saturationMult = 2.0;
+      else if (reportCount <= 20) saturationMult = 1.5;
+      else if (reportCount <= 50) saturationMult = 1.0;
+      else if (reportCount <= 100) saturationMult = 0.7;
+      else saturationMult = 0.4;
+    }
+
+    return 100
+      * opportunityScore * opportunityScore
+      * Math.log10(rewardMaxDollars + 1)
+      * efficiency
+      * sourceCodeBoost
+      * freshnessMult
+      * saturationMult
+      / (1 + missStreak);
+  } catch {
+    return null;
+  }
+}
+
+export interface RankedProgram {
+  program: SecurityProgram;
+  score: number;
+}
+
+/**
+ * Rank all eligible programs for auto-hunt, sorted best-first.
+ *
+ * This is the single source of truth for hunt ordering — used by pickBestProgram(),
+ * the auto-hunt loop, and the dashboard display.
+ *
+ * Filters applied:
+ * - Excluded program handles (EXCLUDE_SECURITY_PROGRAMS)
+ * - Signal-required programs (when SKIP_SIGNAL_REQUIRED is true)
+ * - Cooldown (exponential backoff based on miss streak)
+ * - Minimum reward threshold (SECURITY_MIN_REWARD_CENTS)
+ * - Must have an assessment (opportunityScore > 0)
+ */
+export function rankEligiblePrograms(): RankedProgram[] {
   const db = getDb();
   const config = getConfig();
   const baseCooldownMs = config.SECURITY_HUNT_COOLDOWN_HOURS * 60 * 60 * 1000;
@@ -374,6 +500,7 @@ export function pickBestProgram(): SecurityProgram | null {
   const excludeHandles = new Set(
     (config.EXCLUDE_SECURITY_PROGRAMS ?? []).map((h: string) => h.toLowerCase()),
   );
+  const now = Date.now();
 
   const programs = db
     .select()
@@ -381,93 +508,60 @@ export function pickBestProgram(): SecurityProgram | null {
     .where(eq(schema.securityPrograms.status, "active"))
     .all();
 
-  let best: SecurityProgram | null = null;
-  let bestScore = -1;
-  const now = Date.now();
+  const ranked: RankedProgram[] = [];
 
   for (const p of programs) {
-    // Skip excluded programs (e.g. already hunted, or user doesn't want them)
     if (p.providerProgramId && excludeHandles.has(p.providerProgramId.toLowerCase())) continue;
+    if (p.requiresSignal && config.SKIP_SIGNAL_REQUIRED) continue;
 
-    // Skip programs that have already been hunted
-    if (p.lastHuntedAt) continue;
+    // Skip previously hunted programs entirely (user wants to try everything once first)
+    if (p.lastHuntedAt && config.SKIP_PREVIOUSLY_HUNTED) continue;
 
-    // Skip programs below minimum reward threshold
+    // Cooldown with exponential backoff (only applies when re-hunting is enabled)
+    if (p.lastHuntedAt) {
+      const missStreak = p.huntMissStreak ?? 0;
+      const cooldownMs = baseCooldownMs * Math.pow(2, Math.min(missStreak, 6));
+      if (now - p.lastHuntedAt.getTime() < cooldownMs) continue;
+    }
+
     if ((p.rewardMaxCents ?? 0) < minRewardCents) continue;
 
-    const missStreak = p.huntMissStreak ?? 0;
+    // Skip web-only programs (no source code in scope)
+    if (config.SKIP_WEB_ONLY_PROGRAMS) {
+      const hasSourceCode = (() => {
+        try {
+          const parsed = JSON.parse(p.scopeSummary || "{}");
+          const scopes = parsed.scopes ?? [];
+          return scopes.some(
+            (s: any) =>
+              s.assetType === "SOURCE_CODE" ||
+              (s.assetIdentifier?.includes("github.com")) ||
+              (s.assetIdentifier?.includes("gitlab.com")),
+          );
+        } catch {
+          return false;
+        }
+      })();
+      if (!hasSourceCode) continue;
+    }
 
-    try {
-      const parsed = JSON.parse(p.scopeSummary || "{}");
-      const opportunityScore = parsed.assessment?.opportunityScore ?? 0;
-      if (opportunityScore === 0) continue; // not yet assessed
+    const score = scoreProgram(p);
+    if (score === null || score === 0) continue;
 
-      const rewardMaxDollars = (p.rewardMaxCents ?? 0) / 100;
-      const efficiency = p.responseEfficiency ?? 0.5; // default to 50% if unknown
-
-      // Boost programs with source code in scope
-      const scopes = parsed.scopes ?? [];
-      const hasSourceCode = scopes.some(
-        (s: any) =>
-          s.assetType === "SOURCE_CODE" ||
-          (s.assetIdentifier?.includes("github.com")) ||
-          (s.assetIdentifier?.includes("gitlab.com")),
-      );
-      const sourceCodeBoost = hasSourceCode ? 1.5 : 1.0;
-
-      // ── Freshness multiplier ──
-      // Newer programs = less picked over = higher chance of finding something.
-      // < 6 months: 2.0x  (prime hunting territory)
-      // 6-12 months: 1.5x (still good)
-      // 12-24 months: 1.0x (neutral)
-      // 24-48 months: 0.7x (getting stale)
-      // > 48 months: 0.5x  (heavily researched)
-      let freshnessMult = 1.0;
-      if (p.launchedAt) {
-        const ageMonths = (now - p.launchedAt.getTime()) / (30.44 * 24 * 60 * 60 * 1000);
-        if (ageMonths < 6) freshnessMult = 2.0;
-        else if (ageMonths < 12) freshnessMult = 1.5;
-        else if (ageMonths < 24) freshnessMult = 1.0;
-        else if (ageMonths < 48) freshnessMult = 0.7;
-        else freshnessMult = 0.5;
-      }
-      // If we don't know the launch date, assume it's been around a while (neutral)
-
-      // ── Saturation multiplier ──
-      // Fewer disclosed reports = less researcher attention = more low-hanging fruit.
-      // 0-5 disclosures: 2.0x   (barely touched)
-      // 5-20 disclosures: 1.5x  (lightly researched)
-      // 20-50 disclosures: 1.0x (moderate)
-      // 50-100 disclosures: 0.7x (well researched)
-      // 100+ disclosures: 0.4x  (picked clean)
-      let saturationMult = 1.0;
-      const reportCount = p.disclosedReportCount;
-      if (reportCount != null) {
-        if (reportCount <= 5) saturationMult = 2.0;
-        else if (reportCount <= 20) saturationMult = 1.5;
-        else if (reportCount <= 50) saturationMult = 1.0;
-        else if (reportCount <= 100) saturationMult = 0.7;
-        else saturationMult = 0.4;
-      }
-      // If we don't know the count, stay neutral
-
-      const score = 100
-        * opportunityScore * opportunityScore
-        * Math.log10(rewardMaxDollars + 1)
-        * efficiency
-        * sourceCodeBoost
-        * freshnessMult
-        * saturationMult
-        / (1 + missStreak);
-
-      if (score > bestScore) {
-        bestScore = score;
-        best = p;
-      }
-    } catch {}
+    ranked.push({ program: p, score });
   }
 
-  return best;
+  ranked.sort((a, b) => b.score - a.score);
+  return ranked;
+}
+
+/**
+ * Pick the best program for auto-hunt.
+ * Returns the top-ranked eligible program, or null if none are eligible.
+ */
+export function pickBestProgram(): SecurityProgram | null {
+  const ranked = rankEligiblePrograms();
+  return ranked.length > 0 ? ranked[0].program : null;
 }
 
 // ── Adversarial Review ───────────────────────────────────────
@@ -488,6 +582,7 @@ interface AdversarialRubric {
 
 interface AdversarialReviewResult {
   verdict: "approve" | "reject";
+  recommendation: "submit" | "submit_cautiously" | "dont_submit";
   issues: AdversarialIssue[];
   reasoning: string;
   adjustedConfidence: number;
@@ -507,60 +602,80 @@ function computeConfidenceFromRubric(rubric: AdversarialRubric): number {
 }
 
 /**
- * Run an adversarial review on a report-ready finding.
- * A second Claude Opus instance critiques the report, looking for reasons a triager would reject it.
+ * Fetch fresh program page context from HackerOne for use in adversarial review.
+ * Returns policy text, disclosed reports, and signal requirement status.
  */
-async function runAdversarialReview(
-  finding: SecurityFinding,
-  program: SecurityProgram,
-): Promise<AdversarialReviewResult> {
-  const prompt = buildAdversarialReviewPrompt(finding, program);
-  const raw = await runClaude(prompt, { model: "opus", timeoutMs: 300_000, temperature: 0 });
-
-  // Extract JSON from response (handle possible markdown fences)
-  const parsed = extractJsonWithKey<any>(raw, "verdict");
-  if (!parsed) {
-    throw new Error("Adversarial review returned no valid JSON");
+async function fetchProgramPageContext(program: SecurityProgram): Promise<{
+  policy: string | null;
+  disclosedReports: Array<{ title: string; severity: string; disclosedAt: string }>;
+  disclosedReportCount: number;
+  requiresSignal: boolean;
+}> {
+  const handle = program.providerProgramId;
+  if (!handle || program.provider !== "hackerone") {
+    return { policy: null, disclosedReports: [], disclosedReportCount: 0, requiresSignal: false };
   }
 
-  // Validate and normalize — binary gate: approve or reject
-  const verdict: "approve" | "reject" = parsed.verdict === "approve" ? "approve" : "reject";
-  const issues: AdversarialIssue[] = Array.isArray(parsed.issues)
-    ? parsed.issues.map((i: any) => ({
-        category: i.category ?? "other",
-        severity: ["fatal", "warning", "info"].includes(i.severity) ? i.severity : "warning",
-        description: String(i.description ?? ""),
-      }))
-    : [];
+  const [policyResult, signalResult] = await Promise.allSettled([
+    fetchProgramPolicy(handle),
+    fetchProgramSignalRequirement(handle),
+  ]);
 
-  // Parse rubric scores and compute confidence deterministically
-  const rubric: AdversarialRubric = {
-    exploitability: clampRubricScore(parsed.rubric?.exploitability),
-    impactSeverity: clampRubricScore(parsed.rubric?.impactSeverity),
-    evidenceQuality: clampRubricScore(parsed.rubric?.evidenceQuality),
-    novelty: clampRubricScore(parsed.rubric?.novelty),
-    scopeAlignment: clampRubricScore(parsed.rubric?.scopeAlignment),
-  };
-  const adjustedConfidence = computeConfidenceFromRubric(rubric);
+  const policyData = policyResult.status === "fulfilled" ? policyResult.value : { policy: null, disclosedReports: [], disclosedReportCount: 0 };
+  const requiresSignal = signalResult.status === "fulfilled" ? signalResult.value : null;
 
-  // Any fatal issue must result in reject
-  const hasFatal = issues.some((i) => i.severity === "fatal");
-  const finalVerdict: "approve" | "reject" = hasFatal ? "reject" : verdict;
+  // Update DB if signal requirement changed (only on conclusive results)
+  if (requiresSignal !== null && requiresSignal !== (program.requiresSignal ?? false)) {
+    const db = getDb();
+    db.update(schema.securityPrograms)
+      .set({ requiresSignal, updatedAt: new Date() })
+      .where(eq(schema.securityPrograms.id, program.id))
+      .run();
+    log.info({ programId: program.id, requiresSignal }, "Updated signal requirement from adversarial review fetch");
+  }
 
-  return {
-    verdict: finalVerdict,
-    issues,
-    reasoning: String(parsed.reasoning ?? ""),
-    adjustedConfidence,
-    rubric,
-  };
+  return { ...policyData, requiresSignal: requiresSignal ?? (program.requiresSignal ?? false) };
 }
 
 /**
- * Process report_ready findings through adversarial review.
+ * Build batch context string for cross-referencing sibling findings in the same review queue.
+ * Also includes findings that were filtered by the quality gate during this hunt.
+ */
+function buildBatchContext(currentFindingId: string, allFindings: SecurityFinding[], programId?: string): string {
+  const parts: string[] = [];
+
+  const siblings = allFindings.filter((f) => f.id !== currentFindingId);
+  if (siblings.length > 0) {
+    const lines = siblings.map((f) =>
+      `- [${f.severity}] "${f.title}" (confidence: ${f.confidenceScore}, status: ${f.status})`
+    );
+    parts.push(`## Other Findings in This Review Batch\nThese are other findings being reviewed alongside this one. Consider whether any overlap, contradict, or provide context for the current finding:\n${lines.join("\n")}`);
+  }
+
+  // Include recently quality-gate-filtered findings from the same program
+  if (programId) {
+    const db = getDb();
+    const recentBotRejected = db
+      .select({ title: schema.securityFindings.title, severity: schema.securityFindings.severity, vulnerabilityType: schema.securityFindings.vulnerabilityType })
+      .from(schema.securityFindings)
+      .where(and(eq(schema.securityFindings.programId, programId), eq(schema.securityFindings.status, "bot_rejected")))
+      .all()
+      .slice(-5);
+    if (recentBotRejected.length > 0) {
+      const lines = recentBotRejected.map(f => `- [${f.severity}] "${f.title}" (${f.vulnerabilityType ?? "?"})`);
+      parts.push(`## Previously Rejected Findings on This Program\nThese findings from prior hunts were rejected by adversarial review. Similar findings should be treated with extra skepticism:\n${lines.join("\n")}`);
+    }
+  }
+
+  return parts.length > 0 ? "\n" + parts.join("\n\n") + "\n" : "";
+}
+
+/**
+ * Process report_ready findings through comprehensive adversarial review.
  * When programId is provided, only reviews findings from that program (used after hunts).
  * When omitted, reviews all report_ready findings (used for manual triggers / reassess).
- * Transitions findings to "reviewing" (passed) or "dismissed" (rejected).
+ * Uses a single tool-enabled Claude session per finding that verifies all claims.
+ * Transitions findings to "reviewing" (passed) or "bot_rejected" (rejected).
  */
 export async function processAdversarialQueue(programId?: string): Promise<void> {
   const db = getDb();
@@ -635,8 +750,104 @@ export async function processAdversarialQueue(programId?: string): Promise<void>
         existingNotes = JSON.parse(finding.analysisNotes || "{}");
       } catch {}
 
-      log.info({ findingId: finding.id, title: finding.title }, "Running adversarial review");
-      const review = await runAdversarialReview(finding, program);
+      log.info({ findingId: finding.id, title: finding.title }, "Running comprehensive adversarial review");
+
+      // Step 1: Prepare review workspace (clone target repo if possible)
+      const workspace = await prepareReviewWorkspace(finding as SecurityFinding, program);
+
+      // Step 2: Fetch comprehensive context
+      const programPage = await fetchProgramPageContext(program);
+      const handle = program.providerProgramId;
+      let allDisclosedReports = programPage.disclosedReports;
+      if (handle && program.provider === "hackerone") {
+        try {
+          allDisclosedReports = await fetchAllDisclosedReports(handle, 200);
+        } catch {
+          log.debug({ handle }, "Failed to fetch paginated disclosed reports, using basic set");
+        }
+      }
+
+      const learningContext = await getSecurityLearningContext();
+      const programContext = await getSecurityProgramContext(program.id);
+      const batchContext = buildBatchContext(finding.id, findings, finding.programId ?? undefined);
+
+      const reviewContext: ReviewContext = {
+        workspacePath: workspace.workspacePath,
+        repoCloned: workspace.repoCloned,
+        repoPath: workspace.repoPath,
+        disclosedReports: allDisclosedReports,
+        policy: programPage.policy,
+        requiresSignal: programPage.requiresSignal,
+        learningContext: learningContext ?? "",
+        programContext: programContext ?? "",
+        batchContext,
+      };
+
+      // Step 3: Run single comprehensive tool-enabled review
+      const { output } = await spawnComprehensiveReview(finding as SecurityFinding, program, reviewContext);
+
+      // Step 4: Parse the review result
+      const parsed = extractJsonWithKey<any>(output, "verdict");
+      if (!parsed) {
+        throw new Error("Comprehensive review returned no valid JSON");
+      }
+
+      const verdict: "approve" | "reject" = parsed.verdict === "approve" ? "approve" : "reject";
+      const validRecs = ["submit", "submit_cautiously", "dont_submit"];
+      let recommendation: "submit" | "submit_cautiously" | "dont_submit";
+      if (validRecs.includes(parsed.recommendation)) {
+        recommendation = parsed.recommendation;
+      } else {
+        recommendation = verdict === "approve" ? "submit_cautiously" : "dont_submit";
+      }
+
+      const issues: AdversarialIssue[] = Array.isArray(parsed.issues)
+        ? parsed.issues.map((i: any) => ({
+            category: i.category ?? "other",
+            severity: ["fatal", "warning", "info"].includes(i.severity) ? i.severity : "warning",
+            description: String(i.description ?? ""),
+          }))
+        : [];
+
+      const rubric: AdversarialRubric = {
+        exploitability: clampRubricScore(parsed.rubric?.exploitability),
+        impactSeverity: clampRubricScore(parsed.rubric?.impactSeverity),
+        evidenceQuality: clampRubricScore(parsed.rubric?.evidenceQuality),
+        novelty: clampRubricScore(parsed.rubric?.novelty),
+        scopeAlignment: clampRubricScore(parsed.rubric?.scopeAlignment),
+      };
+      const adjustedConfidence = computeConfidenceFromRubric(rubric);
+
+      // Aggressive auto-reject gates:
+      // 1. Any fatal issue forces reject
+      const hasFatal = issues.some((i) => i.severity === "fatal");
+      // 2. bet100 = false forces dont_submit (reviewer wouldn't stake money on it)
+      const bet100 = parsed.bet100 === true;
+      // 3. Rubric total must meet minimum threshold
+      const rubricTotal = rubric.exploitability + rubric.impactSeverity + rubric.evidenceQuality + rubric.novelty + rubric.scopeAlignment;
+      const minRubricScore = config.SECURITY_MIN_RUBRIC_SCORE;
+      const rubricTooLow = rubricTotal < minRubricScore;
+      // 4. submit_cautiously is now treated as dont_submit (we can't afford marginal reports)
+      const isCautious = recommendation === "submit_cautiously";
+
+      let finalVerdict = hasFatal ? "reject" : verdict;
+      let finalRecommendation: "submit" | "submit_cautiously" | "dont_submit";
+      if (hasFatal || !bet100 || rubricTooLow || isCautious) {
+        finalRecommendation = "dont_submit";
+        if (hasFatal) finalVerdict = "reject";
+      } else {
+        finalRecommendation = recommendation;
+      }
+
+      if (!bet100 && !hasFatal) {
+        log.info({ findingId: finding.id, rubricTotal }, "Finding auto-rejected: reviewer would not bet $100");
+      }
+      if (rubricTooLow && !hasFatal) {
+        log.info({ findingId: finding.id, rubricTotal, minRubricScore }, "Finding auto-rejected: rubric score below threshold");
+      }
+      if (isCautious && !hasFatal && bet100 && !rubricTooLow) {
+        log.info({ findingId: finding.id }, "Finding auto-rejected: submit_cautiously treated as dont_submit to protect Signal");
+      }
 
       // Preserve prior reviews in history
       const reviewHistory = existingNotes.reviewHistory ?? [];
@@ -647,112 +858,27 @@ export async function processAdversarialQueue(programId?: string): Promise<void>
       const updatedNotes = JSON.stringify({
         ...existingNotes,
         adversarialReview: {
-          verdict: review.verdict,
-          issues: review.issues,
-          reasoning: review.reasoning,
-          adjustedConfidence: review.adjustedConfidence,
-          rubric: review.rubric,
+          verdict: finalVerdict,
+          recommendation: finalRecommendation,
+          bet100,
+          rubricTotal,
+          issues,
+          reasoning: String(parsed.reasoning ?? ""),
+          adjustedConfidence,
+          rubric,
           reviewedAt: new Date().toISOString(),
+          toolEnabled: true,
+          repoCloned: workspace.repoCloned,
         },
         reviewHistory,
       });
 
-      if (review.verdict === "approve") {
-        // Phase 2: Tool-enabled verification — actually run the PoC
-        // Retry once if verification returns false but raw output suggests approval (JSON parse issue)
-        log.info({ findingId: finding.id }, "Text review passed — running tool-enabled verification");
-        let verificationPassed = true;
-        let verificationNotes = "";
-        const MAX_VERIFY_ATTEMPTS = 2;
-        for (let attempt = 1; attempt <= MAX_VERIFY_ATTEMPTS; attempt++) {
-          try {
-            const verification = await spawnAdversarialVerification(finding, program);
-            verificationPassed = verification.verified;
-            verificationNotes = verification.output.slice(-500);
-            if (!verificationPassed && attempt < MAX_VERIFY_ATTEMPTS) {
-              // Check if the raw output suggests approval despite structured parse failure
-              const rawApproval = /"verified"\s*:\s*true/i.test(verification.output)
-                               || /"recommendation"\s*:\s*"approve"/i.test(verification.output);
-              if (rawApproval) {
-                log.warn({ findingId: finding.id, attempt }, "Verification returned verified:false but raw output suggests approval — retrying");
-                continue;
-              }
-            }
-            if (!verificationPassed) {
-              log.info({ findingId: finding.id }, "Finding failed tool-enabled verification — PoC did not reproduce");
-            }
-            break;
-          } catch (verifyErr: any) {
-            if (attempt < MAX_VERIFY_ATTEMPTS) {
-              log.warn({ err: verifyErr, findingId: finding.id, attempt }, "Tool-enabled verification errored — retrying");
-              continue;
-            }
-            // If verification fails to run on final attempt, still proceed with text-only review
-            log.warn({ err: verifyErr, findingId: finding.id }, "Tool-enabled verification errored — proceeding with text-only review");
-            break;
-          }
-        }
-
-        const finalNotes = JSON.stringify({
-          ...JSON.parse(updatedNotes),
-          toolVerification: {
-            verified: verificationPassed,
-            notes: verificationNotes,
-            verifiedAt: new Date().toISOString(),
-          },
-        });
-
-        if (!verificationPassed) {
-          // PoC didn't reproduce — dismiss so it won't be re-reviewed
-          db.update(schema.securityFindings)
-            .set({
-              status: "bot_rejected",
-              confidenceScore: Math.min(review.adjustedConfidence, 0.5), // penalize
-              analysisNotes: finalNotes,
-              updatedAt: new Date(),
-            })
-            .where(eq(schema.securityFindings.id, finding.id))
-            .run();
-
-          log.info(
-            { findingId: finding.id },
-            "Finding dismissed — tool verification failed to reproduce PoC",
-          );
-          recordNearMiss({
-            programId: program.id,
-            title: finding.title,
-            vulnType: finding.vulnerabilityType ?? "unknown",
-            reason: "adversarial_reject",
-            reviewFeedback: "PoC failed to reproduce in tool-enabled verification",
-            timestamp: new Date().toISOString(),
-          }).catch(() => {});
-        } else {
-          // Boost confidence when tool verification independently confirms the finding
-          const verifiedConfidence = Math.min(
-            review.adjustedConfidence + 0.15,
-            0.85, // cap — still leave room for human judgment
-          );
-          db.update(schema.securityFindings)
-            .set({
-              status: "reviewing",
-              confidenceScore: verifiedConfidence,
-              analysisNotes: finalNotes,
-              updatedAt: new Date(),
-            })
-            .where(eq(schema.securityFindings.id, finding.id))
-            .run();
-
-          log.info(
-            { findingId: finding.id, confidence: verifiedConfidence, rubricConfidence: review.adjustedConfidence, verified: true },
-            "Finding passed adversarial review + tool verification — awaiting manual approval",
-          );
-        }
-      } else {
-        // Rejected by text review — move to bot_rejected so it won't be re-reviewed
+      // Step 5: Gate on recommendation
+      if (finalRecommendation === "dont_submit" || finalVerdict === "reject") {
         db.update(schema.securityFindings)
           .set({
             status: "bot_rejected",
-            confidenceScore: review.adjustedConfidence,
+            confidenceScore: adjustedConfidence,
             analysisNotes: updatedNotes,
             updatedAt: new Date(),
           })
@@ -760,20 +886,118 @@ export async function processAdversarialQueue(programId?: string): Promise<void>
           .run();
 
         log.info(
-          { findingId: finding.id, reasoning: review.reasoning },
-          "Finding dismissed by adversarial review",
+          { findingId: finding.id, verdict: finalVerdict, recommendation: finalRecommendation, reasoning: parsed.reasoning },
+          "Finding rejected by comprehensive review",
         );
         recordNearMiss({
           programId: program.id,
           title: finding.title,
           vulnType: finding.vulnerabilityType ?? "unknown",
           reason: "adversarial_reject",
-          reviewFeedback: review.reasoning,
+          reviewFeedback: `[${finalRecommendation}] ${parsed.reasoning ?? ""}`,
           timestamp: new Date().toISOString(),
         }).catch(() => {});
+        // Record rejection in program notes so future hunts know this vuln type was rejected here
+        if (finding.vulnerabilityType) {
+          updateProgramNotes(program.id, {
+            vulnTypesRejected: [finding.vulnerabilityType],
+          }).catch(() => {});
+        }
+      } else {
+        // Approved — run separate deverbosification pass and apply corrected severity
+        const correctedSeverity = parsed.correctedSeverity;
+        const updateFields: Record<string, any> = {
+          status: "reviewing",
+          confidenceScore: Math.min(adjustedConfidence + 0.1, 0.85),
+          analysisNotes: updatedNotes,
+          updatedAt: new Date(),
+        };
+        if (correctedSeverity && ["critical", "high", "medium"].includes(correctedSeverity) && correctedSeverity !== finding.severity) {
+          updateFields.severity = correctedSeverity;
+          log.info({ findingId: finding.id, oldSeverity: finding.severity, newSeverity: correctedSeverity }, "Severity corrected by reviewer");
+        }
+
+        // Deverbosify the report in a separate Sonnet call (doesn't contaminate reviewer's judgment)
+        if (finding.reportBody) {
+          try {
+            const cleaned = await deverbosifyReport(finding.reportBody);
+            if (cleaned !== finding.reportBody) {
+              updateFields.reportBody = cleaned;
+              log.info({ findingId: finding.id }, "Report body deverbosified in separate pass");
+            }
+          } catch (err) {
+            log.warn({ err, findingId: finding.id }, "Deverbosification failed, keeping original");
+          }
+        }
+
+        db.update(schema.securityFindings)
+          .set(updateFields)
+          .where(eq(schema.securityFindings.id, finding.id))
+          .run();
+
+        log.info(
+          { findingId: finding.id, confidence: updateFields.confidenceScore, recommendation: finalRecommendation },
+          finalRecommendation === "submit_cautiously"
+            ? "Finding passed review but flagged as CAUTIOUS — awaiting manual approval"
+            : "Finding passed comprehensive review — awaiting manual approval",
+        );
+
+        // Record approval in program notes so future hunts know this vuln type was found here
+        if (finding.vulnerabilityType) {
+          updateProgramNotes(program.id, {
+            vulnTypesFound: [finding.vulnerabilityType],
+          }).catch(() => {});
+        }
+
+        // Auto-submit if enabled and recommendation is "submit" (not "submit_cautiously")
+        // Only HackerOne supports programmatic submission — other providers require manual submission
+        if (config.SECURITY_AUTO_SUBMIT && finalRecommendation === "submit" && program.provider === "hackerone" && program.providerProgramId) {
+          try {
+            const handle = program.providerProgramId;
+            const scopes = await fetchProgramScopes(handle);
+            const reportBody = updateFields.reportBody ?? finding.reportBody ?? "";
+            const payload = await prepareSubmission({
+              teamHandle: handle,
+              finding: {
+                title: finding.title,
+                reportBody,
+                severity: updateFields.severity ?? finding.severity ?? "medium",
+                vulnerabilityType: finding.vulnerabilityType ?? undefined,
+                targetAsset: finding.targetAsset ?? undefined,
+              },
+              scopes,
+              policy: reviewContext.policy ?? undefined,
+            });
+
+            // Don't submit if policy exclusion was detected
+            if (payload.policyExcluded) {
+              log.warn({ findingId: finding.id }, "Auto-submit blocked: policy exclusion detected");
+            } else {
+              const result = await submitReport({ teamHandle: handle, payload });
+              db.update(schema.securityFindings)
+                .set({
+                  status: "submitted",
+                  reportId: result.reportId,
+                  reportUrl: result.reportUrl,
+                  submittedAt: new Date(),
+                  updatedAt: new Date(),
+                })
+                .where(eq(schema.securityFindings.id, finding.id))
+                .run();
+              log.info({ findingId: finding.id, reportId: result.reportId, reportUrl: result.reportUrl }, "Finding auto-submitted to HackerOne");
+            }
+          } catch (submitErr) {
+            log.error({ err: submitErr, findingId: finding.id }, "Auto-submit failed — finding remains in reviewing status for manual submission");
+          }
+        }
       }
+
+      // Clean up review workspace
+      await rm(workspace.workspacePath, { recursive: true, force: true }).catch(() => {});
     } catch (err: any) {
-      log.error({ err, findingId: finding.id }, "Adversarial review failed");
+      log.error({ err, findingId: finding.id }, "Comprehensive adversarial review failed");
+      // Clean up on error too
+      await rm("/tmp/security-review", { recursive: true, force: true }).catch(() => {});
     }
 
     completed++;

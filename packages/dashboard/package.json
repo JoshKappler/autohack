@@ -1,5 +1,5 @@
 {
-  "name": "@algora/dashboard",
+  "name": "@bounty/dashboard",
   "version": "0.0.1",
   "type": "module",
   "scripts": {
@@ -8,7 +8,7 @@
     "start": "next start --port 3456"
   },
   "dependencies": {
-    "@algora/core": "*",
+    "@bounty/core": "*",
     "@tanstack/react-query": "^5.68.0",
     "@trpc/client": "^11.0.0",
     "@trpc/next": "^11.0.0",

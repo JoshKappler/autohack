@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
 process.env.PROJECT_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 
-import { getDb, schema, loadConfig } from "@algora/core";
+import { getDb, schema, loadConfig } from "@bounty/core";
 import { eq } from "drizzle-orm";
 
 async function main() {

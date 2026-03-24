@@ -1,4 +1,4 @@
-import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { readFile, writeFile, mkdir, rename } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { existsSync } from "node:fs";
 import { createLogger } from "./logger";
@@ -75,8 +75,10 @@ async function loadSecurityMemory(): Promise<SecurityMemoryStore> {
 
 async function saveSecurityMemory(store: SecurityMemoryStore): Promise<void> {
   const memPath = getSecurityMemoryPath();
+  const tmpPath = memPath + ".tmp";
   await mkdir(resolve(memPath, ".."), { recursive: true });
-  await writeFile(memPath, JSON.stringify(store, null, 2), "utf-8");
+  await writeFile(tmpPath, JSON.stringify(store, null, 2), "utf-8");
+  await rename(tmpPath, memPath);
 }
 
 /**
@@ -226,6 +228,33 @@ export async function getSecurityLearningContext(): Promise<string> {
     const accepted = store.findingOutcomes.filter((f) => f.submissionResult === "accepted").length;
     const rate = (accepted / total * 100).toFixed(0);
     lines.push(`Confidence calibration: ${rate}% actual acceptance rate across ${total} submissions. Calibrate your confidence scores accordingly — if you're typically overconfident, set a higher bar.`);
+  }
+
+  // Near-miss patterns — what keeps getting filtered or rejected
+  if (store.nearMisses.length > 0) {
+    const recent = store.nearMisses.slice(-50);
+    const byReason: Record<string, number> = {};
+    const byVulnType: Record<string, number> = {};
+    for (const nm of recent) {
+      byReason[nm.reason] = (byReason[nm.reason] ?? 0) + 1;
+      if (nm.vulnType && nm.vulnType !== "unknown") {
+        byVulnType[nm.vulnType] = (byVulnType[nm.vulnType] ?? 0) + 1;
+      }
+    }
+
+    const reasonLines = Object.entries(byReason)
+      .sort(([, a], [, b]) => b - a)
+      .map(([reason, count]) => `  - ${reason}: ${count}x`)
+      .join("\n");
+    lines.push(`Near-miss patterns (${recent.length} recent filtered/rejected findings):\n${reasonLines}`);
+
+    const topFilteredTypes = Object.entries(byVulnType)
+      .sort(([, a], [, b]) => b - a)
+      .slice(0, 5);
+    if (topFilteredTypes.length > 0) {
+      const typeLines = topFilteredTypes.map(([type, count]) => `  - ${type}: ${count}x`).join("\n");
+      lines.push(`Most commonly filtered vuln types (avoid these):\n${typeLines}`);
+    }
   }
 
   return lines.join("\n") + "\n";

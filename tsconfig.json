@@ -4,5 +4,6 @@
     "rootDir": ".",
     "outDir": "dist"
   },
-  "include": ["orchestrator.ts", "packages/*/src/**/*"]
+  "include": ["orchestrator.ts", "packages/*/src/**/*"],
+  "exclude": ["packages/dashboard/**"]
 }

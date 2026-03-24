@@ -15,19 +15,17 @@ const LOG_DIR = join(import.meta.dirname, "..", "data", "logs");
 const DB_PATH = join(import.meta.dirname, "..", "data", "algora.db");
 const DRY_RUN = process.argv.includes("--dry-run");
 
-// Program ID mapping from log filenames
-const PROGRAM_MAP: Record<string, string> = {
-  "hunt-h1-automattic": "h1-automattic",
-  "hunt-h1-launchdarkly": "h1-launchdarkly",
-  "hunt-h1-nextcloud": "h1-nextcloud",
-  "hunt-h1-okg": "h1-okg",
-  "hunt-h1-toolsforhumanity": "h1-toolsforhumanity",
-  "hunt-h1-chia_network": "h1-chia_network",
-  "hunt-h1-deriv": "h1-deriv",
-  "hunt-h1-discourse": "h1-discourse",
-  "hunt-h1-gitlab": "h1-gitlab",
-  "hunt-h1-security": "h1-security",
-};
+// Derive program ID from log filename: hunt-h1-shopify.log -> h1-shopify, hunt-immunefi-foo.log -> immunefi-foo
+function programIdFromLog(logFile: string): string | null {
+  const m = logFile.match(/^hunt-(.+)\.log$/);
+  return m ? m[1] : null;
+}
+
+// For sec-sf-*.log files, look up the program from the finding ID in the log name
+function findingIdFromSecLog(logFile: string): string | null {
+  const m = logFile.match(/^sec-(sf-[a-f0-9]+)\.log$/);
+  return m ? m[1] : null;
+}
 
 interface ParsedFinding {
   title: string;
@@ -38,24 +36,30 @@ interface ParsedFinding {
   reportBody: string;
 }
 
+// Strip ANSI escape sequences (PTY logs contain these)
+const ANSI_RE = /[\x1B\x9B][\[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nq-uy=><~]/g;
+
 function parseFindings(output: string): ParsedFinding[] {
+  // Strip ANSI codes first — PTY logs are full of them
+  const clean = output.replace(ANSI_RE, "");
   const findings: ParsedFinding[] = [];
   const regex = /===FINDING_START===([\s\S]*?)===FINDING_END===/g;
   let match;
 
-  while ((match = regex.exec(output)) !== null) {
+  while ((match = regex.exec(clean)) !== null) {
     const block = match[1].trim();
 
     const title = block.match(/\*\*Title:\*\*\s*(.+)/)?.[1]?.trim() ?? "Untitled Finding";
-    const severity = block.match(/\*\*Severity:\*\*\s*(.+)/)?.[1]?.trim().toLowerCase() ?? "medium";
+    const rawSev = block.match(/\*\*Severity:\*\*\s*(.+)/)?.[1]?.trim().toLowerCase() ?? "medium";
+    const severity = ["critical", "high", "medium", "low", "informational"].find(s => rawSev.includes(s)) ?? "medium";
     const vulnType = block.match(/\*\*Vulnerability Type:\*\*\s*(.+)/)?.[1]?.trim() ?? "Unknown";
-    const target = block.match(/\*\*Target Asset:\*\*\s*(.+)/)?.[1]?.trim() ?? "Unknown";
+    const target = block.match(/\*\*(?:Target )?Asset:\*\*\s*(.+)/)?.[1]?.trim() ?? "Unknown";
     const confMatch = block.match(/\*\*Confidence:\*\*\s*([\d.]+)/);
     const confidence = confMatch ? Math.max(0, Math.min(1, parseFloat(confMatch[1]))) : 0.5;
 
     findings.push({
       title,
-      severity: ["critical", "high", "medium", "low", "informational"].includes(severity) ? severity : "medium",
+      severity,
       vulnerabilityType: vulnType,
       targetAsset: target,
       confidence,
@@ -82,16 +86,44 @@ function main() {
     VALUES (?, ?, ?, ?, ?, ?, ?, 'report_ready', ?, ?, ?, ?, ?, 0)
   `);
 
+  // Build lookup: program slug -> program ID from DB
+  const programs = db.prepare("SELECT id FROM security_programs").all() as Array<{ id: string }>;
+  const programIds = new Set(programs.map((p) => p.id));
+
+  // For sec-sf-*.log files, get the program_id from existing findings
+  const findingPrograms = new Map<string, string>();
+  const fpRows = db.prepare("SELECT id, program_id FROM security_findings").all() as Array<{ id: string; program_id: string }>;
+  for (const r of fpRows) findingPrograms.set(r.id, r.program_id);
+
   let recovered = 0;
   let skippedDuplicate = 0;
   let skippedLowQuality = 0;
+  let skippedNoProgram = 0;
 
-  const logFiles = readdirSync(LOG_DIR).filter((f) => f.startsWith("hunt-h1-") && f.endsWith(".log"));
+  // Scan all hunt-* and sec-* log files
+  const logFiles = readdirSync(LOG_DIR).filter(
+    (f) => f.endsWith(".log") && !f.endsWith(".events.jsonl") && (f.startsWith("hunt-") || f.startsWith("sec-")),
+  );
 
   for (const logFile of logFiles) {
-    const baseName = logFile.replace(".log", "");
-    const programId = PROGRAM_MAP[baseName];
-    if (!programId) continue;
+    // Determine program ID
+    let programId: string | null = programIdFromLog(logFile);
+    if (programId && !programIds.has(programId)) {
+      // Try with underscores replaced by hyphens and vice versa
+      const alt = programId.replace(/_/g, "-");
+      if (programIds.has(alt)) programId = alt;
+    }
+
+    if (!programId) {
+      // sec-sf-*.log: look up finding's program
+      const fid = findingIdFromSecLog(logFile);
+      if (fid) programId = findingPrograms.get(fid) ?? null;
+    }
+
+    if (!programId || !programIds.has(programId)) {
+      // Skip silently — most logs won't need recovery
+      continue;
+    }
 
     const content = readFileSync(join(LOG_DIR, logFile), "utf-8");
     const findings = parseFindings(content);
@@ -116,10 +148,10 @@ function main() {
       }
 
       const findingId = `sf-${randomBytes(8).toString("hex")}`;
-      const traceId = `trc_${randomBytes(4).toString("hex")}`;
+      const traceId = `trc_recovered_${randomBytes(4).toString("hex")}`;
       const now = Math.floor(Date.now() / 1000);
 
-      console.log(`  INSERT: ${f.title} [${f.severity}, ${f.confidence}] → ${findingId}`);
+      console.log(`  INSERT: ${f.title} [${f.severity}, ${f.confidence}] → ${findingId} (program: ${programId})`);
 
       if (!DRY_RUN) {
         insertStmt.run(
@@ -147,6 +179,7 @@ function main() {
   console.log(`Recovered: ${recovered}`);
   console.log(`Skipped (duplicate): ${skippedDuplicate}`);
   console.log(`Skipped (low quality): ${skippedLowQuality}`);
+  console.log(`Skipped (no program): ${skippedNoProgram}`);
 
   db.close();
 }

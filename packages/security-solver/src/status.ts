@@ -1,7 +1,7 @@
 import { writeFile, readFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { existsSync } from "node:fs";
-import { createLogger } from "@algora/core";
+import { createLogger } from "@bounty/core";
 
 const log = createLogger("security-solver-status");
 
@@ -21,6 +21,19 @@ export interface SecuritySolverStatus {
   pid?: number;
   linesOutput?: number;
   lastActivity?: string;
+  // Rich activity tracking — mirrors Claude Code's frontend
+  currentActivity?: string; // e.g. "Running bash", "Reading file", "Thinking", "Responding"
+  currentActivityDetail?: string; // e.g. the command being run, the file being read
+  currentActivityStartedAt?: string;
+  toolUseCount?: number;
+  // Recent activity log for the frontend (last N events)
+  recentEvents?: Array<{
+    type: "tool_use" | "tool_result" | "thinking" | "text";
+    name?: string;
+    detail?: string;
+    startedAt: string;
+    durationMs?: number;
+  }>;
 }
 
 function getStatusPath(): string {

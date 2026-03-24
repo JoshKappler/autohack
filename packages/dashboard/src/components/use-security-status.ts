@@ -30,6 +30,17 @@ export interface SecurityDisplayStatus {
     timeoutMinutes?: number;
     linesOutput?: number;
     lastActivity?: string;
+    currentActivity?: string;
+    currentActivityDetail?: string;
+    currentActivityStartedAt?: string;
+    toolUseCount?: number;
+    recentEvents?: Array<{
+      type: "tool_use" | "tool_result" | "thinking" | "text";
+      name?: string;
+      detail?: string;
+      startedAt: string;
+      durationMs?: number;
+    }>;
   };
 }
 
@@ -82,6 +93,11 @@ export function useSecurityStatus(): SecurityDisplayStatus {
         timeoutMinutes: solverStatus.timeoutMinutes ?? undefined,
         linesOutput: solverStatus.linesOutput ?? undefined,
         lastActivity: solverStatus.lastActivity ?? undefined,
+        currentActivity: solverStatus.currentActivity ?? undefined,
+        currentActivityDetail: solverStatus.currentActivityDetail ?? undefined,
+        currentActivityStartedAt: solverStatus.currentActivityStartedAt ?? undefined,
+        toolUseCount: solverStatus.toolUseCount ?? undefined,
+        recentEvents: solverStatus.recentEvents ?? undefined,
       }
     : undefined;
 
@@ -100,7 +116,7 @@ export function useSecurityStatus(): SecurityDisplayStatus {
       label: "Reviewing Findings",
       detail,
       color: "#fbbf24",
-      model: "Opus",
+      model: configData?.CLAUDE_MODEL ? configData.CLAUDE_MODEL.charAt(0).toUpperCase() + configData.CLAUDE_MODEL.slice(1) : "Opus",
       solverStage: "reviewing",
       isReviewing: true,
       isAnalyzing: false,
@@ -120,7 +136,7 @@ export function useSecurityStatus(): SecurityDisplayStatus {
       label,
       detail,
       color,
-      model: "Opus",
+      model: configData?.CLAUDE_MODEL ? configData.CLAUDE_MODEL.charAt(0).toUpperCase() + configData.CLAUDE_MODEL.slice(1) : "Opus",
       solverStage: stage,
       isReviewing: false,
       isAnalyzing: false,
@@ -137,7 +153,7 @@ export function useSecurityStatus(): SecurityDisplayStatus {
       label,
       detail,
       color: "var(--accent)",
-      model: configData?.analysisModel ? configData.analysisModel.charAt(0).toUpperCase() + configData.analysisModel.slice(1) : "…",
+      model: configData?.ANALYSIS_MODEL ? configData.ANALYSIS_MODEL.charAt(0).toUpperCase() + configData.ANALYSIS_MODEL.slice(1) : "…",
       isReviewing: false,
       isAnalyzing: true,
       isSolving: false,

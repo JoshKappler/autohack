@@ -1,5 +1,5 @@
 export { assessProgram, assessFinding } from "./assessor";
-export type { SecurityAssessmentResult, ProgramAssessmentResult } from "./assessor";
+export type { SecurityAssessmentResult, ProgramAssessmentResult, ProgramAssessmentRubric } from "./assessor";
 export {
   analyzeProgram,
   analyzeAndRankFinding,

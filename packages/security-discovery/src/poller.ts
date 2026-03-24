@@ -1,6 +1,9 @@
 import { eq, inArray } from "drizzle-orm";
-import { getDb, schema, getConfig, createLogger, recordSecurityFindingOutcome, type NewSecurityProgram } from "@algora/core";
-import { fetchPrograms, fetchProgramScopes, fetchProgramDetails, fetchReportStatus, fetchProgramPolicy, fetchProgramResponseEfficiency } from "./hackerone-client";
+import { getDb, schema, getConfig, createLogger, recordSecurityFindingOutcome, type NewSecurityProgram } from "@bounty/core";
+import { fetchPrograms, fetchProgramScopes, fetchProgramDetails, fetchReportStatus, fetchProgramPolicy, fetchProgramResponseEfficiency, fetchProgramSignalRequirement, fetchProgramWeaknesses } from "./hackerone-client";
+import { fetchImmunefiPrograms } from "./immunefi-client";
+import { fetchHuntrPrograms } from "./huntr-client";
+import { fetchAggregatorPrograms } from "./aggregator-client";
 
 const log = createLogger("security-poller");
 
@@ -78,6 +81,14 @@ export async function pollHackerOne(): Promise<number> {
       log.warn({ err, handle: prog.handle }, "Failed to fetch program policy");
     }
 
+    // Fetch accepted weakness types (CWE categories the program accepts reports for)
+    let weaknesses: Array<{ id: number; externalId: string; name: string }> = [];
+    try {
+      weaknesses = await fetchProgramWeaknesses(prog.handle);
+    } catch (err) {
+      log.debug({ err, handle: prog.handle }, "Failed to fetch weaknesses");
+    }
+
     const now = new Date();
     const newProgram: NewSecurityProgram = {
       id,
@@ -89,6 +100,7 @@ export async function pollHackerOne(): Promise<number> {
         scopes,
         ...(policy ? { policy } : {}),
         ...(disclosedReports.length > 0 ? { disclosedReports } : {}),
+        ...(weaknesses.length > 0 ? { weaknesses: weaknesses.map(w => w.name) } : {}),
       }),
       rewardMinCents: rewardMin,
       rewardMaxCents: rewardMax,
@@ -113,6 +125,26 @@ export async function pollHackerOne(): Promise<number> {
       }
     } catch {
       // Non-critical — will be backfilled later
+    }
+
+    // Check if program requires Signal score
+    try {
+      const requiresSignal = await fetchProgramSignalRequirement(prog.handle);
+      if (requiresSignal === true) {
+        db.update(schema.securityPrograms)
+          .set({ requiresSignal: true, updatedAt: now })
+          .where(eq(schema.securityPrograms.id, id))
+          .run();
+        log.info({ id, name: prog.name }, "Program requires Signal score");
+      } else if (requiresSignal === false) {
+        db.update(schema.securityPrograms)
+          .set({ requiresSignal: false, updatedAt: now })
+          .where(eq(schema.securityPrograms.id, id))
+          .run();
+      }
+      // null = inconclusive, leave default
+    } catch {
+      // Non-critical
     }
 
     log.info(
@@ -204,6 +236,61 @@ export async function backfillSecurityRewards(): Promise<number> {
 
   log.info({ backfilled, total: missingRewards.length, errors }, "Reward backfill complete");
   return backfilled;
+}
+
+/**
+ * Backfill signal requirements for HackerOne programs that haven't been checked yet.
+ * Only checks programs where requiresSignal is still the default (false).
+ * Returns the number of programs that were found to require Signal.
+ */
+export async function backfillSignalRequirements(): Promise<number> {
+  const db = getDb();
+
+  // Get all active HackerOne programs that haven't been marked as requiring signal
+  // We re-check all false values since the default is false and most were never checked
+  const unchecked = db
+    .select({
+      id: schema.securityPrograms.id,
+      name: schema.securityPrograms.name,
+      providerProgramId: schema.securityPrograms.providerProgramId,
+    })
+    .from(schema.securityPrograms)
+    .where(eq(schema.securityPrograms.provider, "hackerone"))
+    .all()
+    .filter((p) => p.providerProgramId != null);
+
+  log.info({ count: unchecked.length }, "Backfilling signal requirements");
+
+  let signalRequired = 0;
+  let errors = 0;
+  for (const prog of unchecked) {
+    if (!prog.providerProgramId) continue;
+    try {
+      const requires = await fetchProgramSignalRequirement(prog.providerProgramId);
+      if (requires !== null) {
+        db.update(schema.securityPrograms)
+          .set({ requiresSignal: requires, updatedAt: new Date() })
+          .where(eq(schema.securityPrograms.id, prog.id))
+          .run();
+        if (requires) {
+          signalRequired++;
+          log.info({ id: prog.id, name: prog.name }, "Program requires Signal score");
+        }
+      }
+      // Rate limit: small delay between requests to avoid being blocked
+      await new Promise((r) => setTimeout(r, 200));
+    } catch (err) {
+      errors++;
+      log.debug({ err, id: prog.id }, "Failed to check signal requirement");
+      if (errors > 10) {
+        log.warn("Too many signal backfill errors, stopping early");
+        break;
+      }
+    }
+  }
+
+  log.info({ signalRequired, total: unchecked.length, errors }, "Signal requirement backfill complete");
+  return signalRequired;
 }
 
 /**
@@ -376,6 +463,189 @@ export async function backfillResponseEfficiency(): Promise<number> {
   return backfilled;
 }
 
+// ── Immunefi Polling ──────────────────────────────────────────
+
+/**
+ * Poll Immunefi for bounty programs. All programs have source code (smart contracts).
+ * Returns the number of newly discovered programs.
+ */
+export async function pollImmunefi(): Promise<number> {
+  const config = getConfig();
+  if (!config.IMMUNEFI_ENABLED) return 0;
+
+  log.info("Starting Immunefi poll");
+  const db = getDb();
+  const programs = await fetchImmunefiPrograms();
+  let newCount = 0;
+
+  for (const prog of programs) {
+    const id = `immunefi-${prog.handle}`;
+
+    const existing = db
+      .select()
+      .from(schema.securityPrograms)
+      .where(eq(schema.securityPrograms.id, id))
+      .get();
+
+    if (existing) {
+      // Update rewards if changed
+      if (prog.rewardMaxCents != null && existing.rewardMaxCents !== prog.rewardMaxCents) {
+        db.update(schema.securityPrograms)
+          .set({ rewardMaxCents: prog.rewardMaxCents, rewardMinCents: prog.rewardMinCents, updatedAt: new Date() })
+          .where(eq(schema.securityPrograms.id, id))
+          .run();
+      }
+      continue;
+    }
+
+    // Build scopes from assets
+    const scopes = prog.assets.map(a => ({
+      assetType: a.assetType === "smart_contract" ? "SOURCE_CODE" : a.assetType,
+      assetIdentifier: a.assetIdentifier,
+      eligibleForBounty: a.eligibleForBounty,
+    }));
+
+    const now = new Date();
+    const newProgram: NewSecurityProgram = {
+      id,
+      provider: "immunefi",
+      providerProgramId: prog.handle,
+      name: prog.name,
+      url: prog.url,
+      scopeSummary: JSON.stringify({ scopes }),
+      rewardMinCents: prog.rewardMinCents,
+      rewardMaxCents: prog.rewardMaxCents,
+      launchedAt: prog.launchedAt ? new Date(prog.launchedAt) : null,
+      requiresSignal: false, // Immunefi has no signal requirement
+      status: "active",
+      discoveredAt: now,
+      updatedAt: now,
+    };
+
+    db.insert(schema.securityPrograms).values(newProgram).run();
+    newCount++;
+
+    log.debug({ id, name: prog.name, assets: scopes.length }, "Discovered new Immunefi program");
+  }
+
+  log.info({ newCount, total: programs.length }, "Immunefi poll complete");
+  return newCount;
+}
+
+// ── Huntr Polling ─────────────────────────────────────────────
+
+/**
+ * Poll Huntr for AI/ML open source bounty programs.
+ * All programs are GitHub repos with source code.
+ * Returns the number of newly discovered programs.
+ */
+export async function pollHuntr(): Promise<number> {
+  const config = getConfig();
+  if (!config.HUNTR_ENABLED) return 0;
+
+  log.info("Starting Huntr poll");
+  const db = getDb();
+  const programs = await fetchHuntrPrograms();
+  let newCount = 0;
+
+  for (const prog of programs) {
+    const id = `huntr-${prog.handle}`;
+
+    const existing = db
+      .select()
+      .from(schema.securityPrograms)
+      .where(eq(schema.securityPrograms.id, id))
+      .get();
+
+    if (existing) continue; // Huntr programs are stable, no need to update
+
+    const scopes = [];
+    if (prog.repoUrl) {
+      scopes.push({
+        assetType: "SOURCE_CODE",
+        assetIdentifier: prog.repoUrl,
+        eligibleForBounty: true,
+      });
+    }
+
+    const now = new Date();
+    const newProgram: NewSecurityProgram = {
+      id,
+      provider: "huntr",
+      providerProgramId: prog.handle,
+      name: prog.name,
+      url: prog.url,
+      scopeSummary: JSON.stringify({ scopes }),
+      rewardMinCents: prog.rewardMinCents,
+      rewardMaxCents: prog.rewardMaxCents,
+      requiresSignal: false,
+      status: "active",
+      discoveredAt: now,
+      updatedAt: now,
+    };
+
+    db.insert(schema.securityPrograms).values(newProgram).run();
+    newCount++;
+
+    log.debug({ id, name: prog.name, repoUrl: prog.repoUrl }, "Discovered new Huntr program");
+  }
+
+  log.info({ newCount, total: programs.length }, "Huntr poll complete");
+  return newCount;
+}
+
+// ── Aggregator Polling ────────────────────────────────────────
+
+/**
+ * Poll the bounty-targets-data aggregator for programs from Bugcrowd, Intigriti,
+ * YesWeHack, and Federacy. Only imports programs with source code in scope.
+ * Returns the number of newly discovered programs.
+ */
+export async function pollAggregator(): Promise<number> {
+  const config = getConfig();
+  if (!config.AGGREGATOR_ENABLED) return 0;
+
+  log.info("Starting aggregator poll");
+  const db = getDb();
+  const programs = await fetchAggregatorPrograms({ sourceCodeOnly: true });
+  let newCount = 0;
+
+  for (const prog of programs) {
+    const id = `${prog.provider}-${prog.handle}`;
+
+    const existing = db
+      .select()
+      .from(schema.securityPrograms)
+      .where(eq(schema.securityPrograms.id, id))
+      .get();
+
+    if (existing) continue;
+
+    const now = new Date();
+    const newProgram: NewSecurityProgram = {
+      id,
+      provider: prog.provider as any,
+      providerProgramId: prog.handle,
+      name: prog.name,
+      url: prog.url,
+      scopeSummary: JSON.stringify({ scopes: prog.scopes }),
+      rewardMaxCents: prog.rewardMaxCents,
+      requiresSignal: false,
+      status: "active",
+      discoveredAt: now,
+      updatedAt: now,
+    };
+
+    db.insert(schema.securityPrograms).values(newProgram).run();
+    newCount++;
+
+    log.debug({ id, name: prog.name, provider: prog.provider }, "Discovered new aggregator program");
+  }
+
+  log.info({ newCount, total: programs.length }, "Aggregator poll complete");
+  return newCount;
+}
+
 /**
  * Poll all security bounty providers.
  */
@@ -386,5 +656,31 @@ export async function pollAllSecurityProviders(): Promise<number> {
   } catch (err) {
     log.error({ err }, "HackerOne poll failed");
   }
+
+  try {
+    total += await pollImmunefi();
+  } catch (err) {
+    log.error({ err }, "Immunefi poll failed");
+  }
+
+  try {
+    total += await pollHuntr();
+  } catch (err) {
+    log.error({ err }, "Huntr poll failed");
+  }
+
+  try {
+    total += await pollAggregator();
+  } catch (err) {
+    log.error({ err }, "Aggregator poll failed");
+  }
+
+  // Backfill signal requirements for programs that haven't been checked
+  try {
+    await backfillSignalRequirements();
+  } catch (err) {
+    log.error({ err }, "Signal requirement backfill failed");
+  }
+
   return total;
 }

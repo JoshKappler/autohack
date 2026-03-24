@@ -9,6 +9,10 @@ interface RunClaudeOpts {
   model?: string;
   maxTokens?: number;
   temperature?: number;
+  /** When true, omit --dangerously-skip-permissions so Claude runs tool-free (pure text generation). */
+  disableTools?: boolean;
+  /** System prompt passed via --system-prompt flag (separate from the user message). */
+  systemPrompt?: string;
 }
 
 /** Map short model names to full API model identifiers. */
@@ -49,7 +53,7 @@ function runClaudeCLI(
   const claudePath = process.env.CLAUDE_PATH || "claude";
 
   if (opts?.temperature != null) {
-    log.debug({ model, temperature: opts.temperature }, "Running Claude via CLI (Max subscription) — note: CLI does not support temperature flag, ignored");
+    log.debug({ model, temperature: opts.temperature }, "Running Claude via CLI (Max subscription) — CLI does not support --temperature, output may be non-deterministic");
   } else {
     log.debug({ model }, "Running Claude via CLI (Max subscription)");
   }
@@ -59,15 +63,18 @@ function runClaudeCLI(
     const env = { ...process.env };
     delete env.ANTHROPIC_API_KEY;
 
+    const args = [
+      "--print",
+      ...(opts?.disableTools ? [] : ["--dangerously-skip-permissions"]),
+      "--model", model,
+      "--max-turns", "10",
+      ...(opts?.systemPrompt ? ["--system-prompt", opts.systemPrompt] : []),
+      "-", // read prompt from stdin
+    ];
+
     const child = spawn(
       claudePath,
-      [
-        "--print",
-        "--dangerously-skip-permissions",
-        "--model", model,
-        "--max-turns", "10",
-        "-", // read prompt from stdin
-      ],
+      args,
       {
         stdio: ["pipe", "pipe", "pipe"],
         env,
@@ -139,6 +146,7 @@ async function runClaudeAPI(
     model,
     max_tokens: opts?.maxTokens ?? 4096,
     ...(opts?.temperature != null ? { temperature: opts.temperature } : {}),
+    ...(opts?.systemPrompt ? { system: opts.systemPrompt } : {}),
     messages: [{ role: "user", content: prompt }],
   });
 

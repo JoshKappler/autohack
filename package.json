@@ -1,5 +1,5 @@
 {
-  "name": "algora-bounty-bot",
+  "name": "security-bounty-hunter",
   "version": "0.0.1",
   "private": true,
   "type": "module",
@@ -14,7 +14,6 @@
     "dashboard": "npm run dev --workspace=packages/dashboard"
   },
   "dependencies": {
-    "@algora/sdk": "^0.3.1",
     "@anthropic-ai/sdk": "^0.39.0",
     "@octokit/rest": "^21.1.1",
     "better-sqlite3": "^11.8.1",

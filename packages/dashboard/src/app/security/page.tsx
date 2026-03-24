@@ -10,11 +10,23 @@ const findingStatusGroups: Record<string, string[]> = {
   all: [],
   "in progress": ["discovered", "scanning", "analyzing", "validated", "drafting"],
   "ready": ["report_ready", "reviewing"],
+  "signal blocked": ["report_ready", "reviewing"],
   "submitted": ["submitted", "triaged", "accepted"],
   "rewarded": ["rewarded"],
   "bot rejected": ["bot_rejected"],
   "closed": ["duplicate", "not_applicable", "informative", "failed", "dismissed"],
 };
+
+/** Check if a finding has a signal/submission error in its analysisNotes */
+function hasSubmissionError(analysisNotes: string | null | undefined): boolean {
+  if (!analysisNotes) return false;
+  try {
+    const notes = JSON.parse(analysisNotes);
+    return !!notes.submissionError;
+  } catch {
+    return false;
+  }
+}
 const findingStatuses = Object.keys(findingStatusGroups);
 
 const severityColors: Record<string, { bg: string; text: string }> = {
@@ -229,6 +241,32 @@ function parseAssessment(scopeSummary: string | null): {
   }
 }
 
+function parseReportSections(reportBody: string | null | undefined): {
+  title: string;
+  severity: string;
+  vulnType: string;
+  targetAsset: string;
+  vulnerabilityInfo: string;
+  impact: string;
+} {
+  if (!reportBody) return { title: "", severity: "", vulnType: "", targetAsset: "", vulnerabilityInfo: "", impact: "" };
+
+  const grab = (pattern: RegExp) => reportBody.match(pattern)?.[1]?.trim() ?? "";
+
+  const title = grab(/^\*\*Title:\*\*\s*(.+)/m);
+  const severity = grab(/^\*\*Severity:\*\*\s*(.+)/m);
+  const vulnType = grab(/^\*\*Vulnerability Type:\*\*\s*(.+)/m);
+  const targetAsset = grab(/^\*\*Target Asset:\*\*\s*(.+)/m);
+
+  const vulnMatch = reportBody.match(/\*\*Vulnerability Information:\*\*\s*([\s\S]*?)(?=\*\*Impact:\*\*|$)/);
+  const vulnerabilityInfo = vulnMatch?.[1]?.trim() ?? "";
+
+  const impactMatch = reportBody.match(/\*\*Impact:\*\*\s*([\s\S]*?)(?=={3}FINDING_END={3}|$)/);
+  const impact = impactMatch?.[1]?.trim() ?? "";
+
+  return { title, severity, vulnType, targetAsset, vulnerabilityInfo, impact };
+}
+
 interface AdversarialReviewData {
   verdict: "approve" | "reject";
   issues: Array<{ category: string; severity: string; description: string }>;
@@ -252,17 +290,132 @@ function parseFindingNotes(analysisNotes: string | null): {
   }
 }
 
+const MODEL_OPTIONS = ["opus", "sonnet", "haiku"] as const;
+const EFFORT_OPTIONS = ["low", "medium", "high"] as const;
+
+function ModelConfigPanel() {
+  const { data: config } = trpc.config.useQuery(undefined, { refetchInterval: 5000 });
+  const utils = trpc.useUtils();
+  const setConfig = trpc.setConfig.useMutation({
+    onSuccess: () => utils.config.invalidate(),
+  });
+  const [timeoutDraft, setTimeoutDraft] = useState<string>("");
+  const [timeoutFocused, setTimeoutFocused] = useState(false);
+
+  if (!config) return null;
+
+  const timeout = config.SECURITY_HUNT_TIMEOUT_MINUTES ?? 60;
+
+  const agents: { label: string; sub: string; modelKey: string; effortKey: string; model: string; effort: string }[] = [
+    { label: "Scout", sub: "assessment", modelKey: "ANALYSIS_MODEL", effortKey: "ANALYSIS_EFFORT", model: config.ANALYSIS_MODEL ?? "sonnet", effort: config.ANALYSIS_EFFORT ?? "high" },
+    { label: "Hunt", sub: "discovery", modelKey: "CLAUDE_MODEL", effortKey: "HUNT_EFFORT", model: config.CLAUDE_MODEL ?? "opus", effort: config.HUNT_EFFORT ?? "high" },
+    { label: "Review", sub: "verification", modelKey: "REVIEW_MODEL", effortKey: "REVIEW_EFFORT", model: config.REVIEW_MODEL || config.CLAUDE_MODEL || "opus", effort: config.REVIEW_EFFORT ?? "high" },
+    { label: "Submit", sub: "drafting", modelKey: "SUBMISSION_MODEL", effortKey: "SUBMISSION_EFFORT", model: config.SUBMISSION_MODEL || config.CLAUDE_MODEL || "opus", effort: config.SUBMISSION_EFFORT ?? "high" },
+  ];
+
+  return (
+    <div
+      className="rounded-xl border p-5"
+      style={{ background: "var(--bg-card)", borderColor: "var(--border)" }}
+    >
+      <div className="flex items-center justify-between">
+        <h3 className="text-xs font-semibold uppercase tracking-wider" style={{ color: "var(--text-dim)" }}>
+          Model & Budget
+        </h3>
+        <div className="flex items-center gap-2">
+          <span className="text-[10px] font-medium" style={{ color: "var(--text-dim)" }}>Timeout</span>
+          <input
+            type="text"
+            inputMode="numeric"
+            className="w-12 rounded-md px-2 py-1 text-center font-mono text-xs font-bold"
+            style={{
+              background: "var(--bg-hover, rgba(255,255,255,0.05))",
+              color: "var(--accent)",
+              border: "1px solid var(--border)",
+              outline: "none",
+            }}
+            value={timeoutFocused ? timeoutDraft : `${timeout}`}
+            onFocus={() => { setTimeoutDraft(String(timeout)); setTimeoutFocused(true); }}
+            onBlur={() => {
+              setTimeoutFocused(false);
+              const n = parseInt(timeoutDraft, 10);
+              if (!isNaN(n) && n >= 5 && n <= 240 && n !== timeout) {
+                setConfig.mutate({ key: "SECURITY_HUNT_TIMEOUT_MINUTES", value: n });
+              }
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+            }}
+            onChange={(e) => setTimeoutDraft(e.target.value.replace(/[^0-9]/g, ""))}
+          />
+          <span className="text-[10px]" style={{ color: "var(--text-dim)" }}>min</span>
+        </div>
+      </div>
+      <div className="mt-3 grid grid-cols-4 gap-3">
+        {agents.map((a) => (
+          <div key={a.modelKey}>
+            <div className="mb-2">
+              <span className="text-xs font-semibold">{a.label}</span>
+              <span className="ml-1.5 text-[10px]" style={{ color: "var(--text-dim)" }}>{a.sub}</span>
+            </div>
+            <div className="flex flex-col gap-1">
+              {MODEL_OPTIONS.map((m) => (
+                <button
+                  key={m}
+                  onClick={() => setConfig.mutate({ key: a.modelKey, value: m })}
+                  className="rounded-md px-2 py-1.5 text-xs font-medium transition-all"
+                  style={{
+                    background: a.model === m ? "var(--accent)" : "var(--bg-hover, rgba(255,255,255,0.05))",
+                    color: a.model === m ? "#fff" : "var(--text-dim)",
+                    border: `1px solid ${a.model === m ? "var(--accent)" : "var(--border)"}`,
+                  }}
+                >
+                  {m.charAt(0).toUpperCase() + m.slice(1)}
+                </button>
+              ))}
+            </div>
+            {a.effortKey && (
+              <div className="mt-2">
+                <span className="text-[10px] font-medium" style={{ color: "var(--text-dim)" }}>Effort</span>
+                <div className="mt-1 flex gap-1">
+                  {EFFORT_OPTIONS.map((e) => (
+                    <button
+                      key={e}
+                      onClick={() => setConfig.mutate({ key: a.effortKey, value: e })}
+                      className="flex-1 rounded-md py-1 text-[10px] font-medium transition-all"
+                      style={{
+                        background: a.effort === e ? "rgba(99,102,241,0.2)" : "transparent",
+                        color: a.effort === e ? "var(--accent)" : "var(--text-dim)",
+                        border: `1px solid ${a.effort === e ? "var(--accent)" : "var(--border)"}`,
+                      }}
+                    >
+                      {e.charAt(0).toUpperCase()}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 type Tab = "overview" | "programs" | "findings";
 
 export default function SecurityPage() {
   const [tab, setTab] = useState<Tab>("overview");
   const [filter, setFilter] = useState("all");
+  const [hideSignalFindings, setHideSignalFindings] = useState(true);
   const [sortBy, setSortBy] = useState<string>("discoveredAt");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
   const [programSort, setProgramSort] = useState<string>("score");
   const [programSortDir, setProgramSortDir] = useState<"asc" | "desc">("desc");
   const [expandedFinding, setExpandedFinding] = useState<string | null>(null);
   const [expandedReview, setExpandedReview] = useState<string | null>(null);
+  const [expandedManualSubmit, setExpandedManualSubmit] = useState<string | null>(null);
+  const [platformFilter, setPlatformFilter] = useState<Set<string>>(new Set());
 
   // Force periodic re-renders so relative timestamps (timeAgo) stay fresh
   const [, setTick] = useState(0);
@@ -276,19 +429,64 @@ export default function SecurityPage() {
     {
       sortBy: (serverSortable.includes(programSort) ? programSort : "rewardMaxCents") as any,
       sortDir: serverSortable.includes(programSort) ? programSortDir : "desc",
-      limit: 250,
+      limit: 1000,
     },
     { refetchInterval: 5000 },
   );
 
   // Compute opportunity score and combined score for each program, then sort client-side
+  // Uses the same composite formula as rankEligiblePrograms() in security-solver
   const programs = (() => {
     if (!rawPrograms) return rawPrograms;
+    const now = Date.now();
     const enriched = rawPrograms.map((p: any) => {
-      const { assessment } = parseAssessment(p.scopeSummary);
+      const { assessment, scopes } = parseAssessment(p.scopeSummary);
       const opportunity = assessment?.opportunityScore ?? 0;
       const rewardDollars = (p.rewardMaxCents ?? 0) / 100;
-      const score = 100 * opportunity * opportunity * Math.log10(rewardDollars + 1);
+      const efficiency = p.responseEfficiency ?? 0.5;
+      const missStreak = p.huntMissStreak ?? 0;
+
+      // Source code boost
+      const hasSourceCode = (scopes ?? []).some(
+        (s: any) =>
+          s.assetType === "SOURCE_CODE" ||
+          (s.assetIdentifier?.includes("github.com")) ||
+          (s.assetIdentifier?.includes("gitlab.com")),
+      );
+      const sourceCodeBoost = hasSourceCode ? 1.5 : 1.0;
+
+      // Freshness multiplier
+      let freshnessMult = 1.0;
+      if (p.launchedAt) {
+        const launchedMs = typeof p.launchedAt === "string" ? new Date(p.launchedAt).getTime() : p.launchedAt.getTime?.() ?? p.launchedAt;
+        const ageMonths = (now - launchedMs) / (30.44 * 24 * 60 * 60 * 1000);
+        if (ageMonths < 6) freshnessMult = 2.0;
+        else if (ageMonths < 12) freshnessMult = 1.5;
+        else if (ageMonths < 24) freshnessMult = 1.0;
+        else if (ageMonths < 48) freshnessMult = 0.7;
+        else freshnessMult = 0.5;
+      }
+
+      // Saturation multiplier
+      let saturationMult = 1.0;
+      const reportCount = p.disclosedReportCount;
+      if (reportCount != null) {
+        if (reportCount <= 5) saturationMult = 2.0;
+        else if (reportCount <= 20) saturationMult = 1.5;
+        else if (reportCount <= 50) saturationMult = 1.0;
+        else if (reportCount <= 100) saturationMult = 0.7;
+        else saturationMult = 0.4;
+      }
+
+      const score = 100
+        * opportunity * opportunity
+        * Math.log10(rewardDollars + 1)
+        * efficiency
+        * sourceCodeBoost
+        * freshnessMult
+        * saturationMult
+        / (1 + missStreak);
+
       return { ...p, _opportunity: opportunity, _score: score };
     });
 
@@ -314,7 +512,7 @@ export default function SecurityPage() {
     return enriched;
   })();
 
-  const { data: findings, isLoading: findingsLoading, refetch } = trpc.securityFindings.useQuery(
+  const { data: rawFindings, isLoading: findingsLoading, refetch } = trpc.securityFindings.useQuery(
     {
       ...(filter !== "all" && findingStatusGroups[filter]?.length ? { statuses: findingStatusGroups[filter] } : {}),
       sortBy: sortBy as any,
@@ -322,6 +520,17 @@ export default function SecurityPage() {
     },
     { refetchInterval: 5000 },
   );
+
+  // Client-side filtering: "ready" excludes signal-blocked, "signal blocked" only includes them
+  const findings = (() => {
+    if (!rawFindings) return rawFindings;
+    let filtered = rawFindings;
+    if (filter === "ready") filtered = filtered.filter((f: any) => !hasSubmissionError(f.analysisNotes));
+    if (filter === "signal blocked") filtered = filtered.filter((f: any) => hasSubmissionError(f.analysisNotes));
+    if (hideSignalFindings) filtered = filtered.filter((f: any) => !f.programRequiresSignal);
+    return filtered;
+  })();
+  const signalBlockedCount = rawFindings?.filter((f: any) => f.programRequiresSignal).length ?? 0;
 
   const { data: detailedStats } = trpc.securityDetailedStats.useQuery(undefined, { refetchInterval: 5000 });
   const { data: analyzeStatus } = trpc.securityAnalyzeStatus.useQuery(undefined, { refetchInterval: 2000 });
@@ -335,6 +544,7 @@ export default function SecurityPage() {
       utils.securityDetailedStats.invalidate();
     },
   });
+  const [analyzeSkipSignal, setAnalyzeSkipSignal] = useState(true);
   const analyzeProgramsMutation = trpc.securityAnalyzePrograms.useMutation({
     onSuccess: () => utils.securityAnalyzeStatus.invalidate(),
   });
@@ -357,6 +567,7 @@ export default function SecurityPage() {
   const undoRejectMutation = trpc.securityUndoReject.useMutation({ onSuccess: () => refetch() });
   const retryMutation = trpc.securityRetry.useMutation({ onSuccess: () => refetch() });
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const [submittingId, setSubmittingId] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const approveReportMutation = trpc.securityApproveReport.useMutation({
     onSuccess: (data) => {
@@ -440,13 +651,39 @@ export default function SecurityPage() {
       refetch();
     },
   });
+  const { data: huntQueue } = trpc.securityHuntQueue.useQuery(undefined, { refetchInterval: 10000 });
   const { data: autoHuntEnabled } = trpc.securityAutoHuntEnabled.useQuery(undefined, { refetchInterval: 5000 });
   const setAutoHuntMutation = trpc.securitySetAutoHunt.useMutation({
     onSuccess: () => {
       utils.securityAutoHuntEnabled.invalidate();
     },
   });
-
+  const { data: skipSignalRequired } = trpc.securitySkipSignalRequired.useQuery(undefined, { refetchInterval: 5000 });
+  const setSkipSignalMutation = trpc.securitySetSkipSignal.useMutation({
+    onSuccess: () => {
+      utils.securitySkipSignalRequired.invalidate();
+      utils.securityHuntQueue.invalidate();
+    },
+  });
+  const { data: skipWebOnly } = trpc.securitySkipWebOnly.useQuery(undefined, { refetchInterval: 5000 });
+  const setSkipWebOnlyMutation = trpc.securitySetSkipWebOnly.useMutation({
+    onSuccess: () => {
+      utils.securitySkipWebOnly.invalidate();
+      utils.securityHuntQueue.invalidate();
+    },
+  });
+  const { data: skipPreviouslyHunted } = trpc.securitySkipPreviouslyHunted.useQuery(undefined, { refetchInterval: 5000 });
+  const setSkipPreviouslyHuntedMutation = trpc.securitySetSkipPreviouslyHunted.useMutation({
+    onSuccess: () => {
+      utils.securitySkipPreviouslyHunted.invalidate();
+      utils.securityHuntQueue.invalidate();
+    },
+  });
+  const backfillSignalMutation = trpc.securityBackfillSignal.useMutation({
+    onSuccess: () => {
+      utils.securityPrograms.invalidate();
+    },
+  });
 
   const { isAnalyzing, isSolving, isReviewing, solver: solverStatus, adversarial: adversarialProgress } = securityStatus;
   const isBusy = isAnalyzing || isSolving || isReviewing;
@@ -549,31 +786,25 @@ export default function SecurityPage() {
       {/* ── Overview Tab ── */}
       {tab === "overview" && ds && (
         <div className="mt-5">
-          {/* Stats row */}
-          <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-            <StatCard
-              label="Total Earned"
-              value={ds.totalRewardedCents > 0 ? `$${(ds.totalRewardedCents / 100).toFixed(0)}` : "$0"}
-              sub={`${ds.byStatus["rewarded"] ?? 0} rewarded`}
-              color="var(--green)"
-            />
-            <StatCard
-              label="Available Bounties"
-              value={ds.activePrograms}
-              sub={`${ds.assessedPrograms} assessed, ${unassessedCount} pending`}
-              color={unassessedCount > 0 ? "var(--accent)" : undefined}
-            />
-            <StatCard
-              label="Pipeline"
-              value={ds.activePipeline}
-              sub={`${ds.byStatus["analyzing"] ?? 0} analyzing, ${ds.byStatus["validated"] ?? 0} validated`}
-              color={ds.activePipeline > 0 ? "var(--accent)" : undefined}
-            />
-            <StatCard
-              label="Findings"
-              value={ds.totalFindings}
-              sub={`${ds.discoveredFindings} discovered, ${ds.validatedFindings} validated`}
-            />
+          {/* Stats + Model Config — single row */}
+          <div className="grid items-stretch gap-3" style={{ gridTemplateColumns: "200px 1fr" }}>
+            <div className="flex flex-col gap-3">
+              <div className="flex-1 rounded-xl border p-5" style={{ background: "var(--bg-card)", borderColor: "var(--border)" }}>
+                <p className="text-xs uppercase tracking-wider" style={{ color: "var(--text-dim)" }}>Total Earned</p>
+                <p className="mt-1.5 text-2xl font-bold tracking-tight" style={{ color: "var(--green)" }}>
+                  {ds.totalRewardedCents > 0 ? `$${(ds.totalRewardedCents / 100).toFixed(0)}` : "$0"}
+                </p>
+                <p className="mt-0.5 text-xs" style={{ color: "var(--text-dim)" }}>{ds.byStatus["rewarded"] ?? 0} rewarded</p>
+              </div>
+              <div className="flex-1 rounded-xl border p-5" style={{ background: "var(--bg-card)", borderColor: "var(--border)" }}>
+                <p className="text-xs uppercase tracking-wider" style={{ color: "var(--text-dim)" }}>Available Bounties</p>
+                <p className="mt-1.5 text-2xl font-bold tracking-tight" style={unassessedCount > 0 ? { color: "var(--accent)" } : undefined}>
+                  {ds.activePrograms}
+                </p>
+                <p className="mt-0.5 text-xs" style={{ color: "var(--text-dim)" }}>{ds.assessedPrograms} assessed, {unassessedCount} pending</p>
+              </div>
+            </div>
+            <ModelConfigPanel />
           </div>
 
           {/* Pipeline Status — unified card */}
@@ -637,9 +868,6 @@ export default function SecurityPage() {
                       <div className="text-right text-xs" style={{ color: "var(--text-dim)" }}>
                         {isSolving && solverStatus?.startedAt && (
                           <span>{elapsed(new Date(solverStatus.startedAt).getTime())} / {solverStatus?.timeoutMinutes}m max</span>
-                        )}
-                        {isSolving && solverStatus?.linesOutput != null && (
-                          <p className="font-mono text-[10px]">{solverStatus.linesOutput} lines output</p>
                         )}
                         {isReviewing && adversarialProgress && (
                           <span className="font-mono" style={{ color: "#fbbf24" }}>
@@ -837,27 +1065,13 @@ export default function SecurityPage() {
           {(() => {
             // Compute unassessed and prioritized bounty lists from programs data
             const unassessedBounties = (programs ?? []).filter((p: any) => {
+              if (analyzeSkipSignal && p.requiresSignal) return false;
               const { assessment } = parseAssessment(p.scopeSummary);
               return !assessment?.opportunityScore;
             });
 
-            const assessedBounties = (programs ?? [])
-              .map((p: any) => {
-                const { assessment } = parseAssessment(p.scopeSummary);
-                const opportunity = assessment?.opportunityScore ?? 0;
-                const rewardMax = (p.rewardMaxCents ?? 0) / 100;
-                const efficiency = p.responseEfficiency ?? 0.5;
-                const missStreak = p.huntMissStreak ?? 0;
-                const score = 100 * opportunity * opportunity * Math.log10(rewardMax + 1) * efficiency / (1 + missStreak);
-                return { ...p, _opportunity: opportunity, _score: score };
-              })
-              .filter((p: any) => {
-                if (p._opportunity <= 0) return false;
-                // Exclude all previously hunted bounties
-                if (p.lastHuntedAt) return false;
-                return true;
-              })
-              .sort((a: any, b: any) => b._score - a._score);
+            // Use server-provided hunt queue (same scoring + filters as pickBestProgram)
+            const assessedBounties = (huntQueue ?? []);
 
             return (
               <div className="mt-5 grid gap-4 lg:grid-cols-2">
@@ -872,9 +1086,9 @@ export default function SecurityPage() {
                     </h2>
                     <span
                       className="font-mono text-lg font-bold"
-                      style={{ color: unassessedCount > 0 ? "var(--accent)" : "var(--text-dim)" }}
+                      style={{ color: unassessedBounties.length > 0 ? "var(--accent)" : "var(--text-dim)" }}
                     >
-                      {unassessedCount}
+                      {unassessedBounties.length}
                     </span>
                   </div>
 
@@ -889,12 +1103,12 @@ export default function SecurityPage() {
                       </button>
                     ) : (
                       <button
-                        onClick={() => analyzeProgramsMutation.mutate()}
-                        disabled={unassessedCount === 0 || isBusy}
+                        onClick={() => analyzeProgramsMutation.mutate({ skipSignalRequired: analyzeSkipSignal })}
+                        disabled={unassessedBounties.length === 0 || isBusy}
                         className="flex-1 rounded-lg py-2 text-sm font-semibold transition-colors disabled:opacity-40"
                         style={{ background: "var(--accent)", color: "#fff" }}
                       >
-                        {isBusy && !isAnalyzing ? "Busy" : `Analyze ${unassessedCount} Bount${unassessedCount === 1 ? "y" : "ies"}`}
+                        {isBusy && !isAnalyzing ? "Busy" : `Analyze ${unassessedBounties.length} Bount${unassessedBounties.length === 1 ? "y" : "ies"}`}
                       </button>
                     )}
                     <button
@@ -911,6 +1125,15 @@ export default function SecurityPage() {
                       {reassessMutation.isPending ? "Resetting..." : "Reassess"}
                     </button>
                   </div>
+                  <label className="mt-2 flex items-center gap-2 text-xs cursor-pointer" style={{ color: "var(--text-dim)" }}>
+                    <input
+                      type="checkbox"
+                      checked={analyzeSkipSignal}
+                      onChange={(e) => setAnalyzeSkipSignal(e.target.checked)}
+                      className="rounded"
+                    />
+                    Skip Signal-required programs
+                  </label>
 
                   {/* Unassessed bounties list */}
                   {unassessedBounties.length > 0 ? (
@@ -959,9 +1182,6 @@ export default function SecurityPage() {
                           setAutoHuntMutation.mutate({ enabled: false });
                         } else {
                           setAutoHuntMutation.mutate({ enabled: true });
-                          if (!isBusy && ds.assessedPrograms > 0) {
-                            autoHuntMutation.mutate();
-                          }
                         }
                       }}
                       disabled={ds.assessedPrograms === 0}
@@ -975,6 +1195,9 @@ export default function SecurityPage() {
                       {autoHuntEnabled?.enabled ? "Stop Auto Hunt" : "Start Auto Hunt"}
                     </button>
                   </div>
+                  <p className="mt-2 text-[10px]" style={{ color: "var(--text-dim)" }}>
+                    Filters configured on Bounties tab
+                  </p>
                   {validatedFindingCount > 0 && (
                     <button
                       onClick={() => autoSolveMutation.mutate()}
@@ -995,7 +1218,7 @@ export default function SecurityPage() {
                     </p>
                   )}
 
-                  {/* Prioritized bounty queue */}
+                  {/* Prioritized bounty queue — from server, same order as pickBestProgram */}
                   {assessedBounties.length > 0 ? (
                     <div className="mt-3 max-h-[260px] overflow-y-auto rounded-lg border" style={{ borderColor: "var(--border)" }}>
                       {assessedBounties.map((p: any, i: number) => (
@@ -1006,13 +1229,13 @@ export default function SecurityPage() {
                         >
                           <div className="flex items-center gap-2 truncate" style={{ maxWidth: "55%" }}>
                             <span className="font-mono text-[10px]" style={{ color: "var(--text-dim)" }}>
-                              {i + 1}
+                              {p.rank}
                             </span>
                             <span className="truncate font-medium">{p.name}</span>
                           </div>
                           <div className="flex items-center gap-3">
                             <span className="font-mono" style={{ color: "var(--text-dim)" }}>
-                              {(p._opportunity * 100).toFixed(0)}%
+                              {p.score.toFixed(0)}
                             </span>
                             <span className="font-mono" style={{ color: "var(--green)" }}>
                               {p.rewardMaxCents ? `$${(p.rewardMaxCents / 100).toLocaleString()}` : "--"}
@@ -1059,6 +1282,117 @@ export default function SecurityPage() {
       {/* ── Bounties Tab ── */}
       {tab === "programs" && (
         <div className="mt-5">
+          {/* Filter controls */}
+          <div className="mb-4 rounded-xl border p-4" style={{ background: "var(--bg-card)", borderColor: "var(--border)" }}>
+            <div className="flex flex-wrap items-center gap-4">
+              {/* Platform filter */}
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: "var(--text-dim)" }}>Platform</span>
+                {(() => {
+                  const providerSet = new Set<string>();
+                  for (const p of (programs ?? []) as any[]) providerSet.add(String(p.provider));
+                  const providers = Array.from(providerSet).sort();
+                  const providerLabels: Record<string, string> = {
+                    hackerone: "HackerOne",
+                    immunefi: "Immunefi",
+                    huntr: "Huntr",
+                    bugcrowd: "Bugcrowd",
+                    intigriti: "Intigriti",
+                    yeswehack: "YesWeHack",
+                    federacy: "Federacy",
+                  };
+                  return providers.map((prov) => {
+                    const active = platformFilter.size === 0 || platformFilter.has(prov);
+                    const count = (programs ?? []).filter((p: any) => p.provider === prov).length;
+                    return (
+                      <button
+                        key={prov}
+                        onClick={() => {
+                          setPlatformFilter((prev) => {
+                            const next = new Set(prev);
+                            if (next.has(prov)) {
+                              next.delete(prov);
+                            } else {
+                              next.add(prov);
+                            }
+                            return next;
+                          });
+                        }}
+                        className="rounded-md px-2.5 py-1 text-xs font-medium transition-all"
+                        style={{
+                          background: active ? "var(--accent)" : "var(--bg-hover, rgba(255,255,255,0.05))",
+                          color: active ? "#fff" : "var(--text-dim)",
+                          border: `1px solid ${active ? "var(--accent)" : "var(--border)"}`,
+                          opacity: active ? 1 : 0.6,
+                        }}
+                      >
+                        {providerLabels[prov] ?? prov} <span className="font-mono text-[10px]">({count})</span>
+                      </button>
+                    );
+                  });
+                })()}
+                {platformFilter.size > 0 && (
+                  <button
+                    onClick={() => setPlatformFilter(new Set())}
+                    className="rounded-md px-2 py-1 text-[10px] font-medium"
+                    style={{ color: "var(--text-dim)" }}
+                  >
+                    Clear
+                  </button>
+                )}
+              </div>
+
+              <div className="h-4 w-px" style={{ background: "var(--border)" }} />
+
+              {/* Existing toggles */}
+              <label className="flex items-center gap-2 text-xs cursor-pointer" style={{ color: "var(--text-dim)" }}>
+                <input
+                  type="checkbox"
+                  checked={skipSignalRequired ?? true}
+                  onChange={(e) => setSkipSignalMutation.mutate({ enabled: e.target.checked })}
+                  className="rounded"
+                />
+                Hide Signal-required
+                {(() => {
+                  const count = programs?.filter((p: any) => p.requiresSignal).length ?? 0;
+                  return count > 0 ? <span className="font-mono" style={{ color: "var(--accent)" }}>({count})</span> : null;
+                })()}
+              </label>
+              <label className="flex items-center gap-2 text-xs cursor-pointer" style={{ color: "var(--text-dim)" }}>
+                <input
+                  type="checkbox"
+                  checked={skipWebOnly ?? true}
+                  onChange={(e) => setSkipWebOnlyMutation.mutate({ enabled: e.target.checked })}
+                  className="rounded"
+                />
+                Hide web-only
+                {(() => {
+                  const count = programs?.filter((p: any) => {
+                    const { scopes } = parseAssessment(p.scopeSummary);
+                    return !scopes.some((s: any) => s.assetType === "SOURCE_CODE" || s.assetIdentifier?.includes("github.com") || s.assetIdentifier?.includes("gitlab.com"));
+                  }).length ?? 0;
+                  return count > 0 ? <span className="font-mono" style={{ color: "var(--accent)" }}>({count})</span> : null;
+                })()}
+              </label>
+              <label className="flex items-center gap-2 text-xs cursor-pointer" style={{ color: "var(--text-dim)" }}>
+                <input
+                  type="checkbox"
+                  checked={skipPreviouslyHunted ?? true}
+                  onChange={(e) => setSkipPreviouslyHuntedMutation.mutate({ enabled: e.target.checked })}
+                  className="rounded"
+                />
+                Hide previously hunted
+              </label>
+              <button
+                onClick={() => backfillSignalMutation.mutate()}
+                disabled={backfillSignalMutation.isPending}
+                className="rounded px-2 py-0.5 text-[10px] font-medium transition-colors disabled:opacity-40"
+                style={{ background: "var(--bg-hover)", color: "var(--text-dim)", border: "1px solid var(--border)" }}
+              >
+                {backfillSignalMutation.isPending ? "Checking..." : "Detect Signal"}
+              </button>
+            </div>
+          </div>
           <div className="overflow-x-auto">
             <table className="w-full text-left text-sm">
               <thead>
@@ -1081,9 +1415,30 @@ export default function SecurityPage() {
                     </td>
                   </tr>
                 )}
-                {programs?.map((p: any, idx: number) => {
+                {(() => {
+                  let filteredPrograms = programs;
+                  // Platform filter
+                  if (platformFilter.size > 0) {
+                    filteredPrograms = filteredPrograms?.filter((p: any) => platformFilter.has(p.provider));
+                  }
+                  // Signal filter
+                  if (skipSignalRequired ?? true) {
+                    filteredPrograms = filteredPrograms?.filter((p: any) => !p.requiresSignal);
+                  }
+                  // Web-only filter
+                  if (skipWebOnly ?? true) {
+                    filteredPrograms = filteredPrograms?.filter((p: any) => {
+                      const { scopes } = parseAssessment(p.scopeSummary);
+                      return scopes.some((s: any) => s.assetType === "SOURCE_CODE" || s.assetIdentifier?.includes("github.com") || s.assetIdentifier?.includes("gitlab.com"));
+                    });
+                  }
+                  // Previously hunted filter
+                  if (skipPreviouslyHunted ?? true) {
+                    filteredPrograms = filteredPrograms?.filter((p: any) => !p.lastHuntedAt);
+                  }
+                  return filteredPrograms?.map((p: any, idx: number) => {
                   // Insert a separator row before the first hunted program
-                  const prevProgram = idx > 0 ? programs[idx - 1] : null;
+                  const prevProgram = idx > 0 ? filteredPrograms?.[idx - 1] : null;
                   const showHuntedSeparator = p.lastHuntedAt && (!prevProgram || !prevProgram.lastHuntedAt);
 
                   const { scopes, assessment } = parseAssessment(p.scopeSummary);
@@ -1110,7 +1465,7 @@ export default function SecurityPage() {
                       className="transition-colors"
                       style={{
                         borderBottom: "1px solid var(--border)",
-                        opacity: p.lastHuntedAt ? 0.5 : 1,
+                        opacity: p.lastHuntedAt ? 0.5 : p.requiresSignal ? 0.6 : 1,
                       }}
                       onMouseOver={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
                       onMouseOut={(e) => (e.currentTarget.style.background = "transparent")}
@@ -1130,13 +1485,31 @@ export default function SecurityPage() {
                           ) : (
                             <span className="font-medium">{p.name}</span>
                           )}
-                          {p.lastHuntedAt && (
+                          {p.lastHuntedAt && (p.huntCount ?? 0) > 0 && (
                             <span
                               className="inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase"
                               style={{ background: "#14532d", color: "#4ade80" }}
                               title={`Last hunted: ${timeAgo(p.lastHuntedAt)}`}
                             >
                               Hunted
+                            </span>
+                          )}
+                          {p.lastHuntedAt && (p.huntCount ?? 0) === 0 && (
+                            <span
+                              className="inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase"
+                              style={{ background: "#7f1d1d", color: "#f87171" }}
+                              title={`Hunt failed: ${timeAgo(p.lastHuntedAt)}`}
+                            >
+                              Failed
+                            </span>
+                          )}
+                          {p.requiresSignal && (
+                            <span
+                              className="inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase"
+                              style={{ background: "#422006", color: "#fb923c" }}
+                              title="This program requires a HackerOne Signal score to submit reports"
+                            >
+                              Signal Required
                             </span>
                           )}
                         </div>
@@ -1227,7 +1600,8 @@ export default function SecurityPage() {
                     </tr>
                     </Fragment>
                   );
-                })}
+                });
+                })()}
                 {programs?.length === 0 && (
                   <tr>
                     <td colSpan={8} className="py-6 text-center" style={{ color: "var(--text-dim)" }}>
@@ -1261,10 +1635,18 @@ export default function SecurityPage() {
               </button>
             ))}
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-3">
+              <label className="flex items-center gap-2 text-xs cursor-pointer" style={{ color: "var(--text-dim)" }}>
+                <input
+                  type="checkbox"
+                  checked={hideSignalFindings}
+                  onChange={(e) => setHideSignalFindings(e.target.checked)}
+                />
+                Hide signal-required{signalBlockedCount > 0 ? ` (${signalBlockedCount})` : ""}
+              </label>
               {findings && findings.length > 0 && (
                 <button
-                  onClick={() => reassessFindingsMutation.mutate()}
+                  onClick={() => reassessFindingsMutation.mutate({ excludeSignalBlocked: filter === "ready" || filter === "all" })}
                   disabled={reassessFindingsMutation.isPending || isBusy}
                   className="shrink-0 rounded-md px-3 py-1 text-xs font-medium transition-colors disabled:opacity-40"
                   style={{
@@ -1335,16 +1717,6 @@ export default function SecurityPage() {
                       <td className="py-3 pr-4">
                         <div className="flex items-start gap-2">
                           <span className="font-medium">{f.title}</span>
-                          {f.reportBody && (
-                            <button
-                              onClick={() => setExpandedFinding(expandedFinding === f.id ? null : f.id)}
-                              className="shrink-0 rounded px-1.5 py-0.5 text-xs font-mono"
-                              style={{ background: "var(--bg-card)", color: "var(--text-dim)", border: "1px solid var(--border)" }}
-                              title={expandedFinding === f.id ? "Collapse report" : "View full report"}
-                            >
-                              {expandedFinding === f.id ? "▼" : "▶"} Report
-                            </button>
-                          )}
                         </div>
                         <div className="mt-0.5 flex items-center gap-2 text-xs" style={{ color: "var(--text-dim)" }}>
                           {f.vulnerabilityType && <span>{f.vulnerabilityType}</span>}
@@ -1381,21 +1753,37 @@ export default function SecurityPage() {
                         )}
                         {notes.adversarialReview && (
                           <div className="mt-2">
-                            <button
-                              onClick={() => setExpandedReview(expandedReview === f.id ? null : f.id)}
-                              className="inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium uppercase"
-                              style={{
-                                background: notes.adversarialReview.verdict === "approve" ? "rgba(34,197,94,0.1)" : "rgba(248,113,113,0.1)",
-                                color: notes.adversarialReview.verdict === "approve" ? "var(--green)" : "#f87171",
-                                border: `1px solid ${notes.adversarialReview.verdict === "approve" ? "var(--green)" : "#f87171"}`,
-                              }}
-                            >
-                              <span>{expandedReview === f.id ? "▼" : "▶"}</span>
-                              Review: {notes.adversarialReview.verdict}
-                              <span className="font-mono normal-case" style={{ color: "var(--text-dim)" }}>
-                                ({(notes.adversarialReview.adjustedConfidence * 100).toFixed(0)}%)
-                              </span>
-                            </button>
+                            <div className="flex items-center gap-2">
+                              <button
+                                onClick={() => setExpandedReview(expandedReview === f.id ? null : f.id)}
+                                className="inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium"
+                                style={{
+                                  background: notes.adversarialReview.verdict === "approve" ? "rgba(34,197,94,0.1)" : "rgba(248,113,113,0.1)",
+                                  color: notes.adversarialReview.verdict === "approve" ? "var(--green)" : "#f87171",
+                                  border: `1px solid ${notes.adversarialReview.verdict === "approve" ? "var(--green)" : "#f87171"}`,
+                                }}
+                              >
+                                <span>{expandedReview === f.id ? "▼" : "▶"}</span>
+                                View Analysis
+                                <span className="font-mono" style={{ color: "var(--text-dim)" }}>
+                                  ({(notes.adversarialReview.adjustedConfidence * 100).toFixed(0)}%)
+                                </span>
+                              </button>
+                              {f.reportBody && (
+                                <button
+                                  onClick={() => setExpandedFinding(expandedFinding === f.id ? null : f.id)}
+                                  className="inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium"
+                                  style={{
+                                    background: "rgba(99, 102, 241, 0.1)",
+                                    color: "#818cf8",
+                                    border: "1px solid rgba(99, 102, 241, 0.4)",
+                                  }}
+                                >
+                                  <span>{expandedFinding === f.id ? "▼" : "▶"}</span>
+                                  View Report
+                                </button>
+                              )}
+                            </div>
                             {expandedReview === f.id && (
                               <div
                                 className="mt-2 rounded-md border p-2 text-xs"
@@ -1472,24 +1860,20 @@ export default function SecurityPage() {
                           {(f.status === "reviewing" || f.status === "report_ready") && (
                             <>
                               <button
-                                onClick={() => { setSubmitError(null); approveReportMutation.mutate(f.id); }}
+                                onClick={() => { setSubmitError(null); setSubmittingId(f.id); approveReportMutation.mutate(f.id); }}
                                 disabled={approveReportMutation.isPending}
                                 className="rounded-md px-3 py-1 text-xs font-medium"
                                 style={{ background: "var(--green)", color: "#000" }}
                               >
-                                {approveReportMutation.isPending ? "Submitting…" : "Submit Report"}
+                                {approveReportMutation.isPending && submittingId === f.id ? "Submitting…" : "Submit Report"}
                               </button>
                               {f.reportBody && (
                                 <button
-                                  onClick={() => {
-                                    navigator.clipboard.writeText(f.reportBody!);
-                                    setCopiedId(f.id);
-                                    setTimeout(() => setCopiedId((prev) => prev === f.id ? null : prev), 2000);
-                                  }}
+                                  onClick={() => setExpandedManualSubmit(expandedManualSubmit === f.id ? null : f.id)}
                                   className="rounded-md px-3 py-1 text-xs font-medium"
                                   style={{ background: "#1e1b4b", color: "#818cf8" }}
                                 >
-                                  {copiedId === f.id ? "Copied!" : "Copy Report"}
+                                  {expandedManualSubmit === f.id ? "Hide Copy Panel" : "Copy Report"}
                                 </button>
                               )}
                               {submitError && (
@@ -1602,107 +1986,219 @@ export default function SecurityPage() {
                         )}
                       </td>
                     </tr>
-                    {/* Manual Submission Guide — shown when API submission failed */}
+                    {/* Manual Submission Panel — toggled via Copy Report button */}
                     {(() => {
-                      try {
-                        const notes = JSON.parse(f.analysisNotes || "{}");
-                        if (!notes.manualSubmission) return null;
-                        const ms = notes.manualSubmission;
-                        const cvss = ms.cvss;
-                        return (
-                          <tr>
-                            <td colSpan={7} className="px-4 pb-4">
-                              <div
-                                className="rounded-lg p-4"
-                                style={{ background: "#1a1625", border: "1px solid #7c3aed44" }}
-                              >
-                                <div className="flex items-center justify-between mb-3">
-                                  <span className="text-sm font-semibold" style={{ color: "#c4b5fd" }}>
-                                    Manual Submission Required
-                                  </span>
-                                  {notes.submissionUrl && (
-                                    <a
-                                      href={notes.submissionUrl}
-                                      target="_blank"
-                                      rel="noopener noreferrer"
-                                      className="rounded-md px-3 py-1.5 text-xs font-semibold"
-                                      style={{ background: "#7c3aed", color: "#fff" }}
-                                    >
-                                      Open Submission Form →
-                                    </a>
+                      if (!f.reportBody) return null;
+                      if (expandedManualSubmit !== f.id) return null;
+
+                      const sections = parseReportSections(f.reportBody);
+                      if (!sections.vulnerabilityInfo) return null;
+
+                      const notes = (() => { try { return JSON.parse(f.analysisNotes || "{}"); } catch { return {}; } })();
+                      const ms = notes.manualSubmission;
+                      const provider = (f as any).programProvider ?? "hackerone";
+                      const programHandle = (f as any).programHandle ?? f.programId?.replace(/^h1-|^immunefi-|^huntr-|^bugcrowd-|^intigriti-|^yeswehack-|^federacy-/, "") ?? "";
+                      const programUrl = (f as any).programUrl ?? "";
+
+                      // Build submission URL based on provider
+                      const submissionUrls: Record<string, { url: string; label: string }> = {
+                        hackerone: { url: `https://hackerone.com/${programHandle}/reports/new`, label: "Open HackerOne Form" },
+                        immunefi: { url: programUrl || `https://immunefi.com/bug-bounty/${programHandle}/`, label: "Open Immunefi Program" },
+                        huntr: { url: "https://huntr.com/bounties/disclose", label: "Open Huntr Submission" },
+                        bugcrowd: { url: programUrl || `https://bugcrowd.com/${programHandle}`, label: "Open Bugcrowd Program" },
+                        intigriti: { url: programUrl || `https://app.intigriti.com/programs/${programHandle}`, label: "Open Intigriti Program" },
+                        yeswehack: { url: programUrl || `https://yeswehack.com/programs/${programHandle}`, label: "Open YesWeHack Program" },
+                        federacy: { url: programUrl || `https://federacy.com/programs/${programHandle}`, label: "Open Federacy Program" },
+                      };
+                      const sub = submissionUrls[provider] ?? { url: programUrl || "#", label: `Open ${provider} Program` };
+
+                      const copyField = (id: string, value: string) => {
+                        navigator.clipboard.writeText(value);
+                        setCopiedId(id);
+                        setTimeout(() => setCopiedId((prev) => prev === id ? null : prev), 2000);
+                      };
+
+                      // Build full report text for one-click copy
+                      const fullReport = [
+                        sections.title || f.title ? `# ${sections.title || f.title}` : "",
+                        sections.severity ? `**Severity:** ${sections.severity}` : "",
+                        sections.vulnType ? `**Vulnerability Type:** ${sections.vulnType}` : "",
+                        sections.targetAsset ? `**Target Asset:** ${sections.targetAsset}` : "",
+                        "",
+                        sections.vulnerabilityInfo ? `**Vulnerability Information:**\n${sections.vulnerabilityInfo}` : "",
+                        "",
+                        sections.impact ? `**Impact:**\n${sections.impact}` : "",
+                      ].filter(Boolean).join("\n");
+
+                      return (
+                        <tr>
+                          <td colSpan={7} className="px-4 pb-4">
+                            <div
+                              className="rounded-lg p-4"
+                              style={{ background: "#1a1625", border: "1px solid #7c3aed44" }}
+                            >
+                              <div className="flex items-center justify-between mb-4">
+                                <span className="text-sm font-semibold" style={{ color: "#c4b5fd" }}>
+                                  Manual Submission
+                                  {provider !== "hackerone" && (
+                                    <span className="ml-2 text-[10px] font-normal px-1.5 py-0.5 rounded" style={{ background: "#2d2640", color: "#a78bfa" }}>
+                                      {provider}
+                                    </span>
                                   )}
-                                </div>
-                                {notes.submissionError && (
-                                  <p className="text-xs mb-3" style={{ color: "#ef4444" }}>
-                                    API Error: {notes.submissionError}
-                                  </p>
-                                )}
-                                <div className="space-y-2">
-                                  {[
-                                    { label: "Title", value: ms.title },
-                                    { label: "Severity", value: ms.severity_rating },
-                                    { label: "Weakness", value: ms.weakness_name },
-                                  ].filter(f => f.value).map(({ label, value }) => (
-                                    <div key={label} className="flex items-center gap-2">
-                                      <span className="text-xs font-medium w-20 shrink-0" style={{ color: "#a78bfa" }}>{label}</span>
-                                      <span className="text-xs flex-1 font-mono" style={{ color: "var(--text)" }}>{value}</span>
-                                      <button
-                                        onClick={() => { navigator.clipboard.writeText(value); setCopiedId(`${f.id}-${label}`); setTimeout(() => setCopiedId(p => p === `${f.id}-${label}` ? null : p), 1500); }}
-                                        className="text-[10px] px-1.5 py-0.5 rounded"
-                                        style={{ background: "#2d2640", color: "#a78bfa" }}
-                                      >
-                                        {copiedId === `${f.id}-${label}` ? "✓" : "Copy"}
-                                      </button>
-                                    </div>
-                                  ))}
-                                  {cvss && (
-                                    <div className="mt-2">
-                                      <span className="text-xs font-medium" style={{ color: "#a78bfa" }}>CVSS v3.1</span>
-                                      <div className="grid grid-cols-4 gap-1 mt-1">
-                                        {[
-                                          ["Attack Vector", cvss.attack_vector],
-                                          ["Attack Complexity", cvss.attack_complexity],
-                                          ["Privileges", cvss.privileges_required],
-                                          ["User Interaction", cvss.user_interaction],
-                                          ["Scope", cvss.scope],
-                                          ["Confidentiality", cvss.confidentiality],
-                                          ["Integrity", cvss.integrity],
-                                          ["Availability", cvss.availability],
-                                        ].map(([label, value]) => (
-                                          <div key={label} className="flex items-center gap-1 text-[10px]">
-                                            <span style={{ color: "var(--text-dim)" }}>{label}:</span>
-                                            <span className="font-semibold capitalize" style={{ color: "var(--text)" }}>{value}</span>
-                                          </div>
-                                        ))}
-                                      </div>
-                                    </div>
-                                  )}
-                                  {[
-                                    { label: "Vulnerability Info", value: ms.vulnerability_information },
-                                    { label: "Impact", value: ms.impact },
-                                  ].filter(f => f.value).map(({ label, value }) => (
-                                    <div key={label}>
-                                      <div className="flex items-center justify-between">
-                                        <span className="text-xs font-medium" style={{ color: "#a78bfa" }}>{label}</span>
-                                        <button
-                                          onClick={() => { navigator.clipboard.writeText(value); setCopiedId(`${f.id}-${label}`); setTimeout(() => setCopiedId(p => p === `${f.id}-${label}` ? null : p), 1500); }}
-                                          className="text-[10px] px-1.5 py-0.5 rounded"
-                                          style={{ background: "#2d2640", color: "#a78bfa" }}
-                                        >
-                                          {copiedId === `${f.id}-${label}` ? "✓" : "Copy"}
-                                        </button>
-                                      </div>
-                                      <pre className="mt-1 text-[10px] p-2 rounded overflow-x-auto max-h-40 overflow-y-auto" style={{ background: "#0f0a1a", color: "var(--text-dim)", whiteSpace: "pre-wrap" }}>
-                                        {value.length > 500 ? value.substring(0, 500) + "..." : value}
-                                      </pre>
-                                    </div>
-                                  ))}
+                                </span>
+                                <div className="flex gap-2">
+                                  <button
+                                    onClick={() => copyField(`${f.id}-fullreport`, fullReport)}
+                                    className="rounded-md px-3 py-1.5 text-xs font-semibold"
+                                    style={{ background: "#2d2640", color: "#c4b5fd" }}
+                                  >
+                                    {copiedId === `${f.id}-fullreport` ? "Copied!" : "Copy Full Report"}
+                                  </button>
+                                  <a
+                                    href={sub.url}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="rounded-md px-3 py-1.5 text-xs font-semibold"
+                                    style={{ background: "#7c3aed", color: "#fff" }}
+                                  >
+                                    {sub.label} ↗
+                                  </a>
                                 </div>
                               </div>
-                            </td>
-                          </tr>
-                        );
-                      } catch { return null; }
+                              {notes.submissionError && (
+                                <p className="text-xs mb-3" style={{ color: "#ef4444" }}>
+                                  API Error: {notes.submissionError}
+                                </p>
+                              )}
+
+                              <div className="space-y-3">
+                                {/* Title */}
+                                <div className="rounded-md p-3" style={{ background: "#0f0a1a", border: "1px solid #2d2640" }}>
+                                  <div className="flex items-center justify-between mb-1">
+                                    <span className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: "#a78bfa" }}>
+                                      Report Title
+                                    </span>
+                                    <button
+                                      onClick={() => copyField(`${f.id}-title`, sections.title || f.title)}
+                                      className="text-[10px] px-2 py-0.5 rounded font-medium"
+                                      style={{ background: "#2d2640", color: "#a78bfa" }}
+                                    >
+                                      {copiedId === `${f.id}-title` ? "Copied" : "Copy"}
+                                    </button>
+                                  </div>
+                                  <p className="text-xs font-medium" style={{ color: "var(--text)" }}>
+                                    {sections.title || f.title}
+                                  </p>
+                                </div>
+
+                                {/* Dropdowns row: Severity, Weakness, Asset */}
+                                <div className="grid grid-cols-3 gap-2">
+                                  <div className="rounded-md p-3" style={{ background: "#0f0a1a", border: "1px solid #2d2640" }}>
+                                    <span className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: "#a78bfa" }}>
+                                      Severity
+                                    </span>
+                                    <p className="mt-1 text-xs font-medium capitalize" style={{ color: "var(--text)" }}>
+                                      {sections.severity || f.severity || "medium"}
+                                    </p>
+                                  </div>
+                                  <div className="rounded-md p-3" style={{ background: "#0f0a1a", border: "1px solid #2d2640" }}>
+                                    <span className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: "#a78bfa" }}>
+                                      Weakness (CWE)
+                                    </span>
+                                    <p className="mt-1 text-xs font-medium" style={{ color: "var(--text)" }}>
+                                      {sections.vulnType || f.vulnerabilityType || "--"}
+                                    </p>
+                                  </div>
+                                  <div className="rounded-md p-3" style={{ background: "#0f0a1a", border: "1px solid #2d2640" }}>
+                                    <span className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: "#a78bfa" }}>
+                                      Asset
+                                    </span>
+                                    <p className="mt-1 text-xs font-medium truncate" style={{ color: "var(--text)" }} title={sections.targetAsset || f.targetAsset || ""}>
+                                      {sections.targetAsset || f.targetAsset || "--"}
+                                    </p>
+                                  </div>
+                                </div>
+
+                                {/* Vulnerability Information */}
+                                <div className="rounded-md p-3" style={{ background: "#0f0a1a", border: "1px solid #2d2640" }}>
+                                  <div className="flex items-center justify-between mb-2">
+                                    <span className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: "#a78bfa" }}>
+                                      Vulnerability Information
+                                      <span className="ml-2 normal-case font-normal" style={{ color: "var(--text-dim)" }}>
+                                        ({sections.vulnerabilityInfo.length.toLocaleString()} chars)
+                                      </span>
+                                    </span>
+                                    <button
+                                      onClick={() => copyField(`${f.id}-vulninfo`, sections.vulnerabilityInfo)}
+                                      className="text-[10px] px-2 py-0.5 rounded font-medium"
+                                      style={{ background: "#7c3aed", color: "#fff" }}
+                                    >
+                                      {copiedId === `${f.id}-vulninfo` ? "Copied" : "Copy"}
+                                    </button>
+                                  </div>
+                                  <div
+                                    className="text-[11px] max-h-60 overflow-y-auto overflow-x-auto rounded p-2"
+                                    style={{ background: "#0a0612", color: "var(--text-dim)" }}
+                                  >
+                                    <pre style={{ margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word", fontFamily: "ui-monospace, monospace", lineHeight: 1.5 }}>{sections.vulnerabilityInfo}</pre>
+                                  </div>
+                                </div>
+
+                                {/* Impact */}
+                                <div className="rounded-md p-3" style={{ background: "#0f0a1a", border: "1px solid #2d2640" }}>
+                                  <div className="flex items-center justify-between mb-2">
+                                    <span className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: "#a78bfa" }}>
+                                      Impact
+                                      <span className="ml-2 normal-case font-normal" style={{ color: "var(--text-dim)" }}>
+                                        ({sections.impact.length.toLocaleString()} chars)
+                                      </span>
+                                    </span>
+                                    <button
+                                      onClick={() => copyField(`${f.id}-impact`, sections.impact)}
+                                      className="text-[10px] px-2 py-0.5 rounded font-medium"
+                                      style={{ background: "#7c3aed", color: "#fff" }}
+                                    >
+                                      {copiedId === `${f.id}-impact` ? "Copied" : "Copy"}
+                                    </button>
+                                  </div>
+                                  <div
+                                    className="text-[11px] rounded p-2"
+                                    style={{ background: "#0a0612", color: "var(--text-dim)" }}
+                                  >
+                                    <pre style={{ margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word", fontFamily: "ui-monospace, monospace", lineHeight: 1.5 }}>{sections.impact}</pre>
+                                  </div>
+                                </div>
+
+                                {/* CVSS if available from prepareSubmission */}
+                                {ms?.cvss && (
+                                  <div className="rounded-md p-3" style={{ background: "#0f0a1a", border: "1px solid #2d2640" }}>
+                                    <span className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: "#a78bfa" }}>CVSS v3.1</span>
+                                    <div className="grid grid-cols-4 gap-1 mt-2">
+                                      {(
+                                        [
+                                          ["Attack Vector", ms.cvss.attack_vector],
+                                          ["Attack Complexity", ms.cvss.attack_complexity],
+                                          ["Privileges", ms.cvss.privileges_required],
+                                          ["User Interaction", ms.cvss.user_interaction],
+                                          ["Scope", ms.cvss.scope],
+                                          ["Confidentiality", ms.cvss.confidentiality],
+                                          ["Integrity", ms.cvss.integrity],
+                                          ["Availability", ms.cvss.availability],
+                                        ] as const
+                                      ).map(([label, value]) => (
+                                        <div key={label} className="flex items-center gap-1 text-[10px]">
+                                          <span style={{ color: "var(--text-dim)" }}>{label}:</span>
+                                          <span className="font-semibold capitalize" style={{ color: "var(--text)" }}>{value}</span>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          </td>
+                        </tr>
+                      );
                     })()}
                     </Fragment>
                   );

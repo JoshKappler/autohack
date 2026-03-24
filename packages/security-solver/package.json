@@ -1,9 +1,9 @@
 {
-  "name": "@algora/security-solver",
+  "name": "@bounty/security-solver",
   "version": "0.0.1",
   "type": "module",
   "main": "src/index.ts",
   "dependencies": {
-    "@algora/core": "*"
+    "@bounty/core": "*"
   }
 }

@@ -1,4 +1,4 @@
-import { getConfig, createLogger } from "@algora/core";
+import { getConfig, createLogger } from "@bounty/core";
 
 const log = createLogger("hackerone-client");
 
@@ -369,6 +369,82 @@ export async function fetchProgramPolicy(
 }
 
 /**
+ * Fetch all disclosed reports for a program with cursor-based pagination.
+ * Returns up to `limit` disclosed reports (default 200) for thorough duplicate detection.
+ * Falls back to the 30-report fetchProgramPolicy on error.
+ */
+export async function fetchAllDisclosedReports(
+  programHandle: string,
+  limit = 200,
+): Promise<Array<{ title: string; severity: string; disclosedAt: string }>> {
+  const reports: Array<{ title: string; severity: string; disclosedAt: string }> = [];
+  let cursor: string | null = null;
+  const pageSize = 100;
+
+  try {
+    while (reports.length < limit) {
+      const afterClause: string = cursor ? `, after: "${cursor}"` : "";
+      const query: string = `query($handle: String!) {
+        team(handle: $handle) {
+          hacktivity_items(first: ${pageSize}${afterClause}, filter: { disclosed: true }) {
+            total_count
+            pageInfo { endCursor hasNextPage }
+            edges {
+              node {
+                ... on HacktivityItemInterface {
+                  disclosed_at
+                  severity_rating
+                  report { title }
+                }
+              }
+            }
+          }
+        }
+      }`;
+
+      const response = await fetch("https://hackerone.com/graphql", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query, variables: { handle: programHandle } }),
+      });
+
+      if (!response.ok) break;
+
+      const result: any = await response.json();
+      const connection: any = result?.data?.team?.hacktivity_items;
+      if (!connection) break;
+
+      const edges = connection.edges ?? [];
+      for (const { node } of edges) {
+        if (node?.report?.title) {
+          reports.push({
+            title: node.report.title,
+            severity: node.severity_rating ?? "unknown",
+            disclosedAt: node.disclosed_at ?? "",
+          });
+        }
+      }
+
+      if (!connection.pageInfo?.hasNextPage || !connection.pageInfo?.endCursor) break;
+      cursor = connection.pageInfo.endCursor;
+
+      // Rate limit: 1s between pages
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+  } catch (err) {
+    log.debug({ err, handle: programHandle, fetched: reports.length }, "Paginated disclosed report fetch failed, returning what we have");
+  }
+
+  // If pagination got nothing, fall back to the basic fetch
+  if (reports.length === 0) {
+    const { disclosedReports } = await fetchProgramPolicy(programHandle);
+    return disclosedReports;
+  }
+
+  return reports.slice(0, limit);
+}
+
+/**
  * Strip metadata headers from the report body, keeping only the content sections.
  */
 export function stripReportMetadata(reportBody: string): string {
@@ -434,6 +510,8 @@ export interface SubmissionPayload {
   weakness_name?: string;
   structured_scope_id?: string;
   cvss?: CvssVector;
+  /** True if the submission agent detected this vuln type may be excluded by the program policy */
+  policyExcluded?: boolean;
 }
 
 /**
@@ -502,9 +580,12 @@ export async function prepareSubmission(opts: {
   let weaknessName: string | undefined;
   let structuredScopeId: string | undefined;
   let cvss: CvssVector | undefined;
+  let policyExcluded = false;
 
   try {
-    const { runClaude, extractJsonWithKey } = await import("@algora/core");
+    const { runClaude, extractJsonWithKey } = await import("@bounty/core");
+
+    const policyExcerpt = opts.policy ? opts.policy.slice(0, 2000) : "";
 
     const prompt = `You are selecting form fields for a HackerOne report submission. Do NOT rewrite any report content — just pick the correct values.
 
@@ -514,6 +595,9 @@ export async function prepareSubmission(opts: {
 **Target Asset:** ${opts.finding.targetAsset ?? "Not specified"}
 **Severity:** ${opts.finding.severity}
 **Impact Summary:** ${impact?.substring(0, 500) ?? "Not specified"}
+${policyExcerpt ? `\n## Program Policy (check for exclusions)\n${policyExcerpt}\n` : ""}
+## Task 0: Policy Exclusion Check
+Read the program policy above. Is this vulnerability type explicitly excluded? If yes, set "policyExcluded": true in your response. Common exclusions: information disclosure, missing headers, rate limiting, clickjacking, open redirect. If no policy is provided or the type isn't excluded, set false.
 
 ## Task 1: Select the best matching IDs
 
@@ -542,6 +626,7 @@ Based on the vulnerability, select one value per component:
 Return a JSON object:
 \`\`\`json
 {
+  "policyExcluded": false,
   "fields": {
     "weakness_id": 123,
     "weakness_name": "CWE-327: Use of a Broken or Risky Cryptographic Algorithm",
@@ -562,13 +647,18 @@ Return a JSON object:
 
 Omit weakness_id/structured_scope_id if no good match exists. CVSS is always required. Return ONLY the JSON.`;
 
-    const response = await runClaude(prompt, { timeoutMs: 60_000, model: "sonnet" });
-    const parsed = extractJsonWithKey<{ fields: {
+    const response = await runClaude(prompt, { timeoutMs: 60_000, model: "sonnet", disableTools: true });
+    const parsed = extractJsonWithKey<{ policyExcluded?: boolean; fields: {
       weakness_id?: number;
       weakness_name?: string;
       structured_scope_id?: string;
       cvss?: CvssVector;
     } }>(response, "fields");
+
+    if (parsed?.policyExcluded) {
+      policyExcluded = true;
+      log.warn({ teamHandle: opts.teamHandle, title: opts.finding.title }, "Finding may be excluded by program policy — flagging for review");
+    }
 
     if (parsed?.fields) {
       weaknessId = parsed.fields.weakness_id;
@@ -589,6 +679,7 @@ Omit weakness_id/structured_scope_id if no good match exists. CVSS is always req
     ...(weaknessName ? { weakness_name: weaknessName } : {}),
     ...(structuredScopeId ? { structured_scope_id: structuredScopeId } : {}),
     ...(cvss ? { cvss } : {}),
+    ...(policyExcluded ? { policyExcluded: true } : {}),
   };
 
   log.info({
@@ -643,102 +734,38 @@ export async function submitReport(opts: {
 
   log.info({ teamHandle: opts.teamHandle, title: attrs.title }, "Submitting report to HackerOne");
 
+  // Try submitting, auto-stripping invalid parameters on 400 errors (up to 3 attempts)
   let result: any;
-  try {
-    result = await hackerOnePost("/hackers/reports", {
-      data: { type: "report", attributes: attrs },
-    });
-  } catch (err: any) {
-    const errorText = err.message ?? String(err);
+  let lastError: Error | null = null;
 
-    // On 400/500, let Claude analyze the error and fix the payload
-    if (errorText.includes("400") || errorText.includes("500")) {
-      log.warn({ teamHandle: opts.teamHandle, error: errorText }, "Submission failed — asking Claude to fix payload");
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      result = await hackerOnePost("/hackers/reports", {
+        data: { type: "report", attributes: attrs },
+      });
+      break; // Success
+    } catch (err: any) {
+      lastError = err;
+      const errorText = err.message ?? String(err);
 
-      try {
-        const { runClaude, extractJsonWithKey } = await import("@algora/core");
-
-        const fixPrompt = `A HackerOne report submission failed with this API error:
-
-${errorText}
-
-The payload that was sent:
-${JSON.stringify(attrs, null, 2)}
-
-Analyze the error and produce a corrected payload. Common issues:
-- "impact" parameter invalid → some programs reject the impact field entirely, remove it
-- "weakness_id" invalid → the ID doesn't exist for this program, remove it
-- "structured_scope_id" invalid → wrong scope ID, remove it
-- Missing required custom fields → add them based on the error message
-- Invalid severity_rating → must be one of: critical, high, medium, low, none
-
-Return a JSON object with the FULL corrected attributes (include team_handle):
-\`\`\`json
-{
-  "fixed_attrs": {
-    "team_handle": "...",
-    "title": "...",
-    ...
-  }
-}
-\`\`\``;
-
-        const response = await runClaude(fixPrompt, { timeoutMs: 60_000, model: "sonnet" });
-        const parsed = extractJsonWithKey<{ fixed_attrs: Record<string, unknown> }>(response, "fixed_attrs");
-
-        if (parsed?.fixed_attrs) {
-          log.info({ teamHandle: opts.teamHandle }, "Claude fixed the payload — retrying submission (attempt 2)");
-          try {
-            result = await hackerOnePost("/hackers/reports", {
-              data: { type: "report", attributes: parsed.fixed_attrs },
-            });
-          } catch (retry2Err: any) {
-            // Second attempt also failed — give Claude one more try with both errors
-            const retry2Error = retry2Err.message ?? String(retry2Err);
-            log.warn({ teamHandle: opts.teamHandle, error: retry2Error }, "Retry also failed — asking Claude for final fix");
-
-            const fix2Prompt = `A HackerOne report submission failed TWICE.
-
-First error: ${errorText}
-Second error (after fixing): ${retry2Error}
-
-The payload that was sent on the second attempt:
-${JSON.stringify(parsed.fixed_attrs, null, 2)}
-
-The program's server appears to have issues with certain fields. Produce a MINIMAL payload with only the essential fields. If the server returns 500 with impact included, try removing it entirely. Strip any field that could cause issues.
-
-Return a JSON object:
-\`\`\`json
-{
-  "fixed_attrs": { ... }
-}
-\`\`\``;
-
-            const response2 = await runClaude(fix2Prompt, { timeoutMs: 60_000, model: "sonnet" });
-            const parsed2 = extractJsonWithKey<{ fixed_attrs: Record<string, unknown> }>(response2, "fixed_attrs");
-
-            if (parsed2?.fixed_attrs) {
-              log.info({ teamHandle: opts.teamHandle }, "Claude produced minimal payload — final attempt");
-              result = await hackerOnePost("/hackers/reports", {
-                data: { type: "report", attributes: parsed2.fixed_attrs },
-              });
-            } else {
-              throw retry2Err;
-            }
-          }
-        } else {
-          throw new Error(`Submission failed and Claude could not fix: ${errorText}`);
+      // If a specific parameter is flagged as invalid, strip it and retry
+      const invalidParamMatch = errorText.match(/"parameter":"(\w+)"/);
+      if (invalidParamMatch) {
+        const badParam = invalidParamMatch[1];
+        if (badParam in attrs) {
+          log.warn({ teamHandle: opts.teamHandle, removedParam: badParam, attempt }, "Stripping invalid parameter and retrying");
+          delete attrs[badParam];
+          continue; // Retry without the bad parameter
         }
-      } catch (fixErr: any) {
-        // If Claude fix process fails, surface the API error
-        if (fixErr.message?.includes("HackerOne API")) {
-          throw fixErr;
-        }
-        throw new Error(`Submission failed: ${errorText}`);
       }
-    } else {
-      throw err;
+
+      // No auto-fixable parameter found — break out and throw
+      break;
     }
+  }
+
+  if (!result) {
+    throw lastError ?? new Error("Submission failed");
   }
 
   const reportId = result.data?.id ?? "";
@@ -776,5 +803,38 @@ export async function fetchProgramResponseEfficiency(
     return pct / 100;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Check if a HackerOne program requires a minimum Signal score to submit reports.
+ * Uses the public GraphQL API. Returns true if the program has signal requirements.
+ */
+export async function fetchProgramSignalRequirement(
+  programHandle: string,
+): Promise<boolean | null> {
+  const query = `query($handle: String!) {
+    team(handle: $handle) {
+      signal_requirements_setting {
+        target_signal
+      }
+    }
+  }`;
+
+  try {
+    const response = await fetch("https://hackerone.com/graphql", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query, variables: { handle: programHandle } }),
+    });
+
+    if (!response.ok) return null; // inconclusive — don't change existing value
+    const result = await response.json();
+    if (!result?.data?.team) return null; // query failed or program not found
+    const targetSignal = result.data.team.signal_requirements_setting?.target_signal;
+    // target_signal: null = no requirement, any number (0, -1, positive) = signal required to submit
+    return targetSignal != null;
+  } catch {
+    return null; // inconclusive — don't change existing value
   }
 }

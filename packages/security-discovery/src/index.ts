@@ -1,4 +1,10 @@
-export { pollHackerOne, pollAllSecurityProviders, backfillSecurityRewards, backfillResponseEfficiency, pollSubmissionStatuses } from "./poller";
-export { fetchPrograms, fetchProgramScopes, submitReport, prepareSubmission, fetchReportStatus, fetchProgramPolicy, fetchProgramResponseEfficiency, fetchProgramWeaknesses } from "./hackerone-client";
+export { pollHackerOne, pollImmunefi, pollHuntr, pollAggregator, pollAllSecurityProviders, backfillSecurityRewards, backfillSignalRequirements, backfillResponseEfficiency, pollSubmissionStatuses } from "./poller";
+export { fetchPrograms, fetchProgramScopes, submitReport, prepareSubmission, fetchReportStatus, fetchProgramPolicy, fetchAllDisclosedReports, fetchProgramResponseEfficiency, fetchProgramWeaknesses, fetchProgramSignalRequirement } from "./hackerone-client";
 export type { SubmissionPayload, CvssVector } from "./hackerone-client";
 export type { HackerOneProgramInfo, HackerOneSubmissionResult, HackerOneReportStatus } from "./hackerone-client";
+export { fetchImmunefiPrograms } from "./immunefi-client";
+export type { ImmunefiProgram } from "./immunefi-client";
+export { fetchHuntrPrograms } from "./huntr-client";
+export type { HuntrProgram } from "./huntr-client";
+export { fetchAggregatorPrograms } from "./aggregator-client";
+export type { AggregatorProgram } from "./aggregator-client";

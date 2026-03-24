@@ -10,65 +10,57 @@ const configSchema = z.object({
   // Auth
   GITHUB_TOKEN: z.string().min(1),
   ANTHROPIC_API_KEY: z.string().optional().default(""),
-  ALGORA_TOKEN: z.string().optional().default(""),
 
   // Claude backend: "cli" (uses Max subscription) or "api" (uses ANTHROPIC_API_KEY)
   CLAUDE_BACKEND: z.enum(["cli", "api"]).default("cli"),
 
-  // Provider toggles
-  ALGORA_ENABLED: z.coerce.boolean().default(true),
-  ALGORA_POLL_MINUTES: z.coerce.number().default(5),
-  GITHUB_SEARCH_ENABLED: z.coerce.boolean().default(true),
-  GITHUB_SEARCH_POLL_MINUTES: z.coerce.number().default(60),
-
-  // Security bounty providers
+  // HackerOne
   HACKERONE_ENABLED: z.coerce.boolean().default(false),
   HACKERONE_POLL_MINUTES: z.coerce.number().default(60),
   HACKERONE_USERNAME: z.string().optional().default(""),
   HACKERONE_API_TOKEN: z.string().optional().default(""),
 
+  // Immunefi (crypto/web3 bounties — all have source code)
+  IMMUNEFI_ENABLED: z.coerce.boolean().default(false),
+
+  // Huntr (AI/ML open source bounties — all have source code)
+  HUNTR_ENABLED: z.coerce.boolean().default(false),
+
+  // Aggregator (bounty-targets-data — discovers programs from Bugcrowd, Intigriti, YesWeHack, Federacy)
+  AGGREGATOR_ENABLED: z.coerce.boolean().default(false),
+
   // Security solver
   SECURITY_AUTO_HUNT_ENABLED: z.coerce.boolean().default(false),
-  SECURITY_HUNT_TIMEOUT_MINUTES: z.coerce.number().default(120),
-  SECURITY_SOURCE_CODE_TIMEOUT_MINUTES: z.coerce.number().default(120),
-  SECURITY_MIN_CONFIDENCE: z.coerce.number().default(0.65),
+  SECURITY_HUNT_TIMEOUT_MINUTES: z.coerce.number().default(60),
+  SECURITY_SOURCE_CODE_TIMEOUT_MINUTES: z.coerce.number().default(60),
+  SECURITY_MIN_CONFIDENCE: z.coerce.number().default(0.80),
+  SECURITY_MIN_RUBRIC_SCORE: z.coerce.number().default(10), // minimum adversarial review rubric total (out of 15) to pass
   SECURITY_HUNT_COOLDOWN_HOURS: z.coerce.number().default(2),
-SECURITY_MIN_REWARD_CENTS: z.coerce.number().default(10000), // $100 minimum to justify 2h Opus
-  SECURITY_MAX_DAILY_HUNTS: z.coerce.number().default(12),
+  SECURITY_MIN_REWARD_CENTS: z.coerce.number().default(10000), // $100 minimum to justify 2h Opus
+  SECURITY_MAX_DAILY_HUNTS: z.coerce.number().default(999), // effectively unlimited
   SECURITY_MAX_REVISE_ATTEMPTS: z.coerce.number().default(2), // deprecated — review is now binary approve/reject
   SECURITY_SUBMISSION_POLL_MINUTES: z.coerce.number().default(60),
+  SECURITY_AUTO_SUBMIT: z.coerce.boolean().default(false), // auto-submit findings that pass review with "submit" recommendation
   EXCLUDE_SECURITY_PROGRAMS: commaSplit.default(""), // comma-separated program handles to skip (e.g. "okg,spotify")
+  SKIP_SIGNAL_REQUIRED: z.coerce.boolean().default(true), // skip programs that require HackerOne Signal score
+  SKIP_PREVIOUSLY_HUNTED: z.coerce.boolean().default(true), // skip programs that have been hunted at least once
+  SKIP_WEB_ONLY_PROGRAMS: z.coerce.boolean().default(true), // skip programs without source code in scope
 
-  // Discovery
-  TARGET_LANGUAGES: z
-    .string()
-    .default("all")
-    .transform((s) => (s === "all" ? [] : s.split(",").map((x) => x.trim()))),
-  EXCLUDE_ORGS: commaSplit.default(""),
-  EXCLUDE_REPOS: commaSplit.default(""),
-  MAX_ISSUE_AGE_DAYS: z.coerce.number().default(30),
-
-  // Analysis
+  // Models
   ANALYSIS_MODEL: z.string().default("sonnet"),
-  MIN_BOUNTY_CENTS: z.coerce.number().default(500), // $5 minimum
-
-  // Solver
   CLAUDE_MODEL: z.string().default("opus"),
-  SOLVE_TIMEOUT_MINUTES: z.coerce.number().default(45),
-  MAX_TURNS: z.coerce.number().default(100),
-  MAX_RETRY_ATTEMPTS: z.coerce.number().default(3),
-  MAX_ANALYSIS_RETRIES: z.coerce.number().default(3),
+  REVIEW_MODEL: z.string().default(""), // model for adversarial review, empty = use CLAUDE_MODEL
+  SUBMISSION_MODEL: z.string().default(""), // model for report drafting, empty = use CLAUDE_MODEL
 
-  // Control
-  REQUIRE_APPROVAL: z.coerce.boolean().default(true),
-  AUTO_RESPOND_REVIEWS: z.coerce.boolean().default(false),
-  AUTO_FIX_REVIEWS: z.coerce.boolean().default(false),
-  MAX_REVIEW_FIX_ATTEMPTS: z.coerce.number().default(2),
-  MAX_CONCURRENT_BOUNTIES: z.coerce.number().default(1),
+  // Effort levels (low | medium | high)
+  HUNT_EFFORT: z.string().default("high"),
+  REVIEW_EFFORT: z.string().default("high"),
+  SUBMISSION_EFFORT: z.string().default("high"),
+  ANALYSIS_EFFORT: z.string().default("high"),
 
   // Paths
   WORKSPACE_DIR: z.string().default(".workspaces"),
-  DB_PATH: z.string().default("data/algora.db"),
+  DB_PATH: z.string().default("data/bounty.db"),
 
   // Dashboard
   DASHBOARD_PORT: z.coerce.number().default(3456),
