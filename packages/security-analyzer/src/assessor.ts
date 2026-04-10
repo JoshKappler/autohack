@@ -3,6 +3,7 @@ import {
   createLogger,
   extractJsonWithKey,
   runClaude,
+  runClaudeStructured,
   type SecurityProgram,
   type SecurityFinding,
 } from "@bounty/core";
@@ -161,17 +162,51 @@ Respond with ONLY valid JSON, no markdown fences:
   log.debug({ name: program.name, hasSourceCode }, "Assessing program opportunity");
 
   try {
-    const text = await runClaude(prompt, {
+    const parsed = await runClaudeStructured<any>(prompt, {
       model: config.ANALYSIS_MODEL,
       maxTokens: 1024,
       temperature: 0,
       timeoutMs: 180_000,
       disableTools: true,
+      toolName: "assess_program",
+      fallbackKey: "rubric",
+      inputSchema: {
+        type: "object",
+        properties: {
+          rubric: {
+            type: "object",
+            properties: {
+              sourceCodeQuality: { type: "integer", minimum: 0, maximum: 3 },
+              webApiSurface: { type: "integer", minimum: 0, maximum: 3 },
+              techStackMatch: { type: "integer", minimum: 0, maximum: 3 },
+              scopeBreadth: { type: "integer", minimum: 0, maximum: 3 },
+              rewardEfficiency: { type: "integer", minimum: 0, maximum: 3 },
+            },
+            required: ["sourceCodeQuality", "webApiSurface", "techStackMatch", "scopeBreadth", "rewardEfficiency"],
+          },
+          targetCount: { type: "integer" },
+          topTargets: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                asset: { type: "string" },
+                type: { type: "string" },
+                reasoning: { type: "string" },
+                strategy: { type: "string", enum: ["code_review", "web_testing", "api_testing", "domain_recon"] },
+              },
+              required: ["asset", "type", "reasoning"],
+            },
+          },
+          techStack: { type: "array", items: { type: "string" } },
+          attackSurface: { type: "string" },
+          recommendedApproach: { type: "string", enum: ["code_review", "web_testing", "api_testing", "mixed"] },
+        },
+        required: ["rubric", "targetCount", "topTargets", "techStack", "attackSurface", "recommendedApproach"],
+      },
     });
-
-    const parsed = extractJsonWithKey<any>(text, "rubric");
     if (!parsed) {
-      throw new Error(`Could not parse program assessment JSON: ${text.slice(0, 200)}`);
+      throw new Error("Could not parse program assessment — no valid JSON returned");
     }
 
     // Normalize rubric scores to 0-3 integers
@@ -265,17 +300,30 @@ Respond with ONLY valid JSON, no markdown fences:
   log.debug({ title: finding.title }, "Assessing finding");
 
   try {
-    const text = await runClaude(prompt, {
+    const result = await runClaudeStructured<SecurityAssessmentResult>(prompt, {
       model: config.ANALYSIS_MODEL,
       maxTokens: 1024,
       temperature: 0,
-      timeoutMs: 180_000, // 3 min — Sonnet via CLI needs time for startup + reasoning
-      disableTools: true, // pure reasoning task — no tool access needed
+      timeoutMs: 180_000,
+      disableTools: true,
+      toolName: "assess_finding",
+      fallbackKey: "difficulty",
+      inputSchema: {
+        type: "object",
+        properties: {
+          difficulty: { type: "number", minimum: 0, maximum: 1 },
+          confidence: { type: "number", minimum: 0, maximum: 1 },
+          severity: { type: "string", enum: ["critical", "high", "medium", "low", "informational"] },
+          vulnerabilityType: { type: "string" },
+          approach: { type: "string" },
+          riskFactors: { type: "array", items: { type: "string" } },
+          estimatedRewardCents: { type: "integer" },
+        },
+        required: ["difficulty", "confidence", "severity", "vulnerabilityType", "approach", "riskFactors", "estimatedRewardCents"],
+      },
     });
-
-    const result = extractJsonWithKey<SecurityAssessmentResult>(text, "difficulty");
     if (!result) {
-      throw new Error(`Could not parse finding assessment JSON: ${text.slice(0, 200)}`);
+      throw new Error("Could not parse finding assessment — no valid JSON returned");
     }
 
     result.difficulty = Math.max(0, Math.min(1, result.difficulty ?? 0.5));

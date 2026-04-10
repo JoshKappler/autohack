@@ -400,6 +400,10 @@ export const appRouter = router({
     const program = db.select().from(schema.securityPrograms).where(eq(schema.securityPrograms.id, finding.programId)).get();
     if (!program) return { success: false, error: "Associated program not found" };
 
+    if (program.provider !== "hackerone") {
+      return { success: false, error: `Auto-submit is only supported for HackerOne programs. This is a ${program.provider} program — use "Copy Report" for manual submission.` };
+    }
+
     const teamHandle = program.id.replace("h1-", "");
 
     let payload: any;

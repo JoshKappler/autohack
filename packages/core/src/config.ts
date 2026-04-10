@@ -33,8 +33,8 @@ const configSchema = z.object({
   SECURITY_AUTO_HUNT_ENABLED: z.coerce.boolean().default(false),
   SECURITY_HUNT_TIMEOUT_MINUTES: z.coerce.number().default(60),
   SECURITY_SOURCE_CODE_TIMEOUT_MINUTES: z.coerce.number().default(60),
-  SECURITY_MIN_CONFIDENCE: z.coerce.number().default(0.80),
-  SECURITY_MIN_RUBRIC_SCORE: z.coerce.number().default(10), // minimum adversarial review rubric total (out of 15) to pass
+  SECURITY_MIN_CONFIDENCE: z.coerce.number().default(0.65),
+  SECURITY_MIN_RUBRIC_SCORE: z.coerce.number().default(8), // minimum adversarial review rubric total (out of 15) to pass
   SECURITY_HUNT_COOLDOWN_HOURS: z.coerce.number().default(2),
   SECURITY_MIN_REWARD_CENTS: z.coerce.number().default(10000), // $100 minimum to justify 2h Opus
   SECURITY_MAX_DAILY_HUNTS: z.coerce.number().default(999), // effectively unlimited

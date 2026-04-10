@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { getConfig } from "./config";
+import { extractJsonWithKey } from "./json-utils";
 import { createLogger } from "./logger";
 
 const log = createLogger("claude");
@@ -13,6 +14,15 @@ interface RunClaudeOpts {
   disableTools?: boolean;
   /** System prompt passed via --system-prompt flag (separate from the user message). */
   systemPrompt?: string;
+}
+
+interface StructuredOutputOpts extends RunClaudeOpts {
+  /** Tool name for the structured output call. */
+  toolName: string;
+  /** JSON Schema for the expected output. */
+  inputSchema: Record<string, unknown>;
+  /** Key to look for when falling back to text extraction (CLI mode). */
+  fallbackKey: string;
 }
 
 /** Map short model names to full API model identifiers. */
@@ -142,15 +152,96 @@ async function runClaudeAPI(
 
   const model = resolveApiModel(opts?.model ?? config.CLAUDE_MODEL);
 
+  // Use prompt caching on system prompts — they're large and stable across batch calls.
+  // cache_control: ephemeral keeps the prefix cached for ~5 min, cutting input costs ~90%.
+  const systemParam = opts?.systemPrompt
+    ? [{ type: "text" as const, text: opts.systemPrompt, cache_control: { type: "ephemeral" as const } }]
+    : undefined;
+
   const response = await client.messages.create({
     model,
     max_tokens: opts?.maxTokens ?? 4096,
     ...(opts?.temperature != null ? { temperature: opts.temperature } : {}),
-    ...(opts?.systemPrompt ? { system: opts.systemPrompt } : {}),
+    ...(systemParam ? { system: systemParam } : {}),
     messages: [{ role: "user", content: prompt }],
   });
 
   const text =
     response.content[0].type === "text" ? response.content[0].text : "";
   return text.trim();
+}
+
+/**
+ * Run a prompt through Claude and get structured JSON output.
+ *
+ * - API mode: Uses tool_use with forced tool_choice for guaranteed valid JSON.
+ * - CLI mode: Falls back to text generation + extractJsonWithKey parsing.
+ *
+ * Returns the parsed object or null if extraction fails.
+ */
+export async function runClaudeStructured<T = Record<string, unknown>>(
+  prompt: string,
+  opts: StructuredOutputOpts,
+): Promise<T | null> {
+  const config = getConfig();
+
+  if (config.CLAUDE_BACKEND === "api") {
+    return runClaudeStructuredAPI<T>(prompt, opts);
+  }
+
+  // CLI fallback: text generation + JSON extraction
+  const text = await runClaudeCLI(prompt, opts);
+  return extractJsonWithKey<T>(text, opts.fallbackKey);
+}
+
+async function runClaudeStructuredAPI<T>(
+  prompt: string,
+  opts: StructuredOutputOpts,
+): Promise<T | null> {
+  const config = getConfig();
+
+  if (!config.ANTHROPIC_API_KEY) {
+    throw new Error(
+      "CLAUDE_BACKEND=api but ANTHROPIC_API_KEY is not set.",
+    );
+  }
+
+  log.debug({ tool: opts.toolName }, "Running Claude structured output via API");
+
+  const { default: Anthropic } = await import("@anthropic-ai/sdk");
+  const client = new Anthropic({ apiKey: config.ANTHROPIC_API_KEY });
+
+  const model = resolveApiModel(opts.model ?? config.CLAUDE_MODEL);
+
+  const systemParam = opts.systemPrompt
+    ? [{ type: "text" as const, text: opts.systemPrompt, cache_control: { type: "ephemeral" as const } }]
+    : undefined;
+
+  const response = await client.messages.create({
+    model,
+    max_tokens: opts.maxTokens ?? 4096,
+    ...(opts.temperature != null ? { temperature: opts.temperature } : {}),
+    ...(systemParam ? { system: systemParam } : {}),
+    messages: [{ role: "user", content: prompt }],
+    tools: [
+      {
+        name: opts.toolName,
+        description: `Return structured ${opts.toolName} data.`,
+        input_schema: opts.inputSchema as any,
+      },
+    ],
+    tool_choice: { type: "tool" as const, name: opts.toolName },
+  });
+
+  const toolBlock = response.content.find((b: any) => b.type === "tool_use");
+  if (!toolBlock || toolBlock.type !== "tool_use") {
+    log.warn("No tool_use block in structured response, falling back to text extraction");
+    const text = response.content.find((b: any) => b.type === "text");
+    if (text && text.type === "text") {
+      return extractJsonWithKey<T>(text.text, opts.fallbackKey);
+    }
+    return null;
+  }
+
+  return (toolBlock as any).input as T;
 }

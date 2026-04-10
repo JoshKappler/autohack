@@ -408,6 +408,7 @@ export default function SecurityPage() {
   const [tab, setTab] = useState<Tab>("overview");
   const [filter, setFilter] = useState("all");
   const [hideSignalFindings, setHideSignalFindings] = useState(true);
+  const [findingsProviderFilter, setFindingsProviderFilter] = useState<Set<string>>(new Set());
   const [sortBy, setSortBy] = useState<string>("discoveredAt");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
   const [programSort, setProgramSort] = useState<string>("score");
@@ -478,11 +479,15 @@ export default function SecurityPage() {
         else saturationMult = 0.4;
       }
 
+      // Boost low-barrier platforms (no ID verification, no reputation gate)
+      const lowBarrierBoost = p.provider === "huntr" ? 1.5 : 1.0;
+
       const score = 100
         * opportunity * opportunity
         * Math.log10(rewardDollars + 1)
         * efficiency
         * sourceCodeBoost
+        * lowBarrierBoost
         * freshnessMult
         * saturationMult
         / (1 + missStreak);
@@ -528,6 +533,7 @@ export default function SecurityPage() {
     if (filter === "ready") filtered = filtered.filter((f: any) => !hasSubmissionError(f.analysisNotes));
     if (filter === "signal blocked") filtered = filtered.filter((f: any) => hasSubmissionError(f.analysisNotes));
     if (hideSignalFindings) filtered = filtered.filter((f: any) => !f.programRequiresSignal);
+    if (findingsProviderFilter.size > 0) filtered = filtered.filter((f: any) => findingsProviderFilter.has(f.programProvider));
     return filtered;
   })();
   const signalBlockedCount = rawFindings?.filter((f: any) => f.programRequiresSignal).length ?? 0;
@@ -1636,6 +1642,58 @@ export default function SecurityPage() {
             ))}
             </div>
             <div className="flex items-center gap-3">
+              {/* Provider filter */}
+              <div className="flex items-center gap-1.5">
+                {(() => {
+                  const providerSet = new Set<string>();
+                  for (const f of (rawFindings ?? []) as any[]) if (f.programProvider) providerSet.add(String(f.programProvider));
+                  const providers = Array.from(providerSet).sort();
+                  const providerLabels: Record<string, string> = {
+                    hackerone: "H1",
+                    immunefi: "Immunefi",
+                    huntr: "Huntr",
+                    bugcrowd: "Bugcrowd",
+                    intigriti: "Intigriti",
+                    yeswehack: "YWH",
+                    federacy: "Federacy",
+                  };
+                  return providers.map((prov) => {
+                    const active = findingsProviderFilter.size === 0 || findingsProviderFilter.has(prov);
+                    return (
+                      <button
+                        key={prov}
+                        onClick={() => {
+                          setFindingsProviderFilter((prev) => {
+                            const next = new Set(prev);
+                            if (next.has(prov)) next.delete(prov);
+                            else next.add(prov);
+                            return next;
+                          });
+                        }}
+                        className="rounded-md px-2 py-0.5 text-[10px] font-medium transition-all"
+                        style={{
+                          background: active ? "var(--accent)" : "var(--bg-hover, rgba(255,255,255,0.05))",
+                          color: active ? "#fff" : "var(--text-dim)",
+                          border: `1px solid ${active ? "var(--accent)" : "var(--border)"}`,
+                          opacity: active ? 1 : 0.6,
+                        }}
+                      >
+                        {providerLabels[prov] ?? prov}
+                      </button>
+                    );
+                  });
+                })()}
+                {findingsProviderFilter.size > 0 && (
+                  <button
+                    onClick={() => setFindingsProviderFilter(new Set())}
+                    className="text-[10px] font-medium"
+                    style={{ color: "var(--text-dim)" }}
+                  >
+                    Clear
+                  </button>
+                )}
+              </div>
+              <div className="h-4 w-px" style={{ background: "var(--border)" }} />
               <label className="flex items-center gap-2 text-xs cursor-pointer" style={{ color: "var(--text-dim)" }}>
                 <input
                   type="checkbox"

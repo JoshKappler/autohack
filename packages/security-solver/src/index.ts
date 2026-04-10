@@ -439,6 +439,9 @@ export function scoreProgram(p: SecurityProgram): number | null {
     );
     const sourceCodeBoost = hasSourceCode ? 1.5 : 1.0;
 
+    // Boost low-barrier platforms (no ID verification, no reputation gate)
+    const lowBarrierBoost = p.provider === "huntr" ? 1.5 : 1.0;
+
     // Freshness: newer programs = less picked over
     let freshnessMult = 1.0;
     if (p.launchedAt) {
@@ -466,6 +469,7 @@ export function scoreProgram(p: SecurityProgram): number | null {
       * Math.log10(rewardMaxDollars + 1)
       * efficiency
       * sourceCodeBoost
+      * lowBarrierBoost
       * freshnessMult
       * saturationMult
       / (1 + missStreak);
@@ -818,35 +822,38 @@ export async function processAdversarialQueue(programId?: string): Promise<void>
       };
       const adjustedConfidence = computeConfidenceFromRubric(rubric);
 
-      // Aggressive auto-reject gates:
+      // Auto-reject gates:
       // 1. Any fatal issue forces reject
       const hasFatal = issues.some((i) => i.severity === "fatal");
-      // 2. bet100 = false forces dont_submit (reviewer wouldn't stake money on it)
+      // 2. bet100 check (soft signal — only rejects if verdict is also "reject")
       const bet100 = parsed.bet100 === true;
       // 3. Rubric total must meet minimum threshold
       const rubricTotal = rubric.exploitability + rubric.impactSeverity + rubric.evidenceQuality + rubric.novelty + rubric.scopeAlignment;
       const minRubricScore = config.SECURITY_MIN_RUBRIC_SCORE;
       const rubricTooLow = rubricTotal < minRubricScore;
-      // 4. submit_cautiously is now treated as dont_submit (we can't afford marginal reports)
-      const isCautious = recommendation === "submit_cautiously";
 
       let finalVerdict = hasFatal ? "reject" : verdict;
       let finalRecommendation: "submit" | "submit_cautiously" | "dont_submit";
-      if (hasFatal || !bet100 || rubricTooLow || isCautious) {
+      if (hasFatal || rubricTooLow) {
+        // Hard gates: fatal issues or very low rubric score
         finalRecommendation = "dont_submit";
         if (hasFatal) finalVerdict = "reject";
+      } else if (!bet100 && verdict === "reject") {
+        // bet100=false only forces reject when reviewer also rejected
+        finalRecommendation = "dont_submit";
       } else {
+        // submit_cautiously passes through to manual review instead of auto-rejecting
         finalRecommendation = recommendation;
       }
 
-      if (!bet100 && !hasFatal) {
-        log.info({ findingId: finding.id, rubricTotal }, "Finding auto-rejected: reviewer would not bet $100");
+      if (hasFatal) {
+        log.info({ findingId: finding.id, rubricTotal }, "Finding rejected: fatal issue identified");
       }
       if (rubricTooLow && !hasFatal) {
         log.info({ findingId: finding.id, rubricTotal, minRubricScore }, "Finding auto-rejected: rubric score below threshold");
       }
-      if (isCautious && !hasFatal && bet100 && !rubricTooLow) {
-        log.info({ findingId: finding.id }, "Finding auto-rejected: submit_cautiously treated as dont_submit to protect Signal");
+      if (!bet100 && verdict === "reject" && !hasFatal && !rubricTooLow) {
+        log.info({ findingId: finding.id }, "Finding rejected: reviewer would not bet $100 and verdict is reject");
       }
 
       // Preserve prior reviews in history
