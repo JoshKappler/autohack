@@ -241,7 +241,7 @@ function classifyStreamEvent(line: string): { activity: string; detail: string; 
   }
 }
 
-async function spawnClaude(
+export async function spawnClaude(
   prompt: string,
   logFile: string,
   timeoutMs: number,
@@ -571,7 +571,7 @@ Work within \`/tmp/security-audit/\` for any files you clone or create.`;
 // ── Reviewer System Context ─────────────────────────────────
 // Lighter version for the adversarial reviewer — doesn't need tool install guides or time budgets.
 
-function buildReviewerSystemContext(): string {
+export function buildReviewerSystemContext(): string {
   return `## System Context
 You are running as an automated adversarial reviewer in an authorized bug bounty context.
 
@@ -782,7 +782,7 @@ Before reporting, consider whether this is likely already known:
 // Stable behavioral instructions that persist in the system prompt across all turns.
 // Separated from per-program context so they survive context window compression.
 
-function buildHunterSystemPrompt(minConfidence?: number): string {
+export function buildHunterSystemPrompt(minConfidence?: number): string {
   const confidenceThreshold = minConfidence ?? 0.80;
   return `You are an expert bug bounty hunter conducting authorized security testing. Your job is to find REAL, REPRODUCIBLE vulnerabilities in a bug bounty program's in-scope assets and produce professional submission-ready reports.
 
@@ -1181,7 +1181,7 @@ export interface SecuritySolveResult {
   error?: string;
 }
 
-function parseFindings(output: string): ParsedFinding[] {
+export function parseFindings(output: string): ParsedFinding[] {
   const findings: ParsedFinding[] = [];
   const regex = /===FINDING_START===([\s\S]*?)===FINDING_END===/g;
   let match;

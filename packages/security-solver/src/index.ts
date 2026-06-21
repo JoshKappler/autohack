@@ -54,6 +54,9 @@ function releaseHuntLock(): void {
 export function isSecuritySolving(): boolean { return solving; }
 
 export { killActiveSecurityProcess } from "./claude-runner";
+// Exposed for standalone local-target hunts (see scripts/hunt-local.ts) — drives the
+// same engine without the DB/HackerOne plumbing.
+export { spawnClaude, buildHunterSystemPrompt, buildReviewerSystemContext, parseFindings, type ParsedFinding } from "./claude-runner";
 export { readSecuritySolverStatus, clearSecuritySolverStatus, readAdversarialReviewStatus, clearAdversarialReviewStatus, cancelAdversarialReview } from "./status";
 export type { SecuritySolverStatus, AdversarialReviewStatus } from "./status";
 
